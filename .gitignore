@@ -1,0 +1,22 @@
+# Binaries
+sfync
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Go build cache
+vendor/
+*.out
+
+# IDE / AI
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+.DS_Store
