@@ -169,6 +169,22 @@ func main() {
 	case "version", "--version", "-v":
 		fmt.Printf("sfync version %s\n", version)
 
+	case "--completions":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: sfync --completions <fish|bash|zsh>")
+			os.Exit(1)
+		}
+		if err := cmd.Completions(os.Args[2]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "--list-profiles":
+		if err := cmd.ListProfiles(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "help", "--help", "-h":
 		printUsage()
 
