@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -16,29 +18,37 @@ func mountSSHFS(profile *config.Profile, mountPoint string) error {
 	// Build remote path
 	remote := fmt.Sprintf("%s@%s:%s", profile.Username, profile.Host, profile.RemotePath)
 
-	// Determine authentication method
 	useSSHKey := profile.SSHKey != ""
+	verifyHostKey := profile.VerifyHostKey == nil || *profile.VerifyHostKey
 
-	// StrictHostKeyChecking=no / UserKnownHostsFile=/dev/null skips host key
-	// verification for the FUSE mount. The SFTP sync path uses its own TOFU
-	// logic; for a mount we trade that check for simplicity.
 	args := []string{
 		remote,
 		mountPoint,
 		"-p", fmt.Sprintf("%d", profile.Port),
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "reconnect",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",
 	}
 
-	// Add authentication-specific options
+	if verifyHostKey {
+		// TOFU: accept new hosts and add to known_hosts; reject changed keys.
+		// Requires OpenSSH >= 7.6 (StrictHostKeyChecking=accept-new).
+		homeDir, _ := os.UserHomeDir()
+		knownHostsPath := filepath.Join(homeDir, ".ssh", "known_hosts")
+		args = append(args,
+			"-o", "StrictHostKeyChecking=accept-new",
+			"-o", "UserKnownHostsFile="+knownHostsPath,
+		)
+	} else {
+		args = append(args,
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+		)
+	}
+
 	if useSSHKey {
-		// Use SSH key authentication
 		args = append(args, "-o", fmt.Sprintf("IdentityFile=%s", profile.SSHKey))
 	} else {
-		// Use password authentication
 		args = append(args, "-o", "password_stdin")
 	}
 

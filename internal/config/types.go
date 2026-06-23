@@ -54,7 +54,7 @@ func (p *Profile) Validate() error {
 // SetDefaults applies default values for optional fields
 func (p *Profile) SetDefaults() {
 	if p.Protocol == "" {
-		p.Protocol = "ftp"
+		p.Protocol = "sftp"
 	}
 	if p.Port == 0 {
 		if p.Protocol == "sftp" {
