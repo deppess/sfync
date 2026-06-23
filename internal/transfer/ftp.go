@@ -247,12 +247,15 @@ func (c *ftpClient) MkdirAll(remotePath string) error {
 			// Use ChangeDir to check existence — O(1) vs a full List call.
 			cwd, cwdErr := c.conn.CurrentDir()
 			if cwdErr == nil {
-				if cdErr := c.conn.ChangeDir(current); cdErr == nil {
-					// Directory exists — restore cwd and continue
-					_ = c.conn.ChangeDir(cwd)
+				cdErr := c.conn.ChangeDir(current)
+				// Always restore cwd; a failed restore corrupts all subsequent paths.
+				if restoreErr := c.conn.ChangeDir(cwd); restoreErr != nil {
+					return wrapError("mkdir", fmt.Errorf("failed to restore working directory after checking %s: %w", current, restoreErr))
+				}
+				if cdErr == nil {
+					// Directory exists — continue to next component.
 					continue
 				}
-				_ = c.conn.ChangeDir(cwd)
 			}
 			return wrapError("mkdir", err)
 		}

@@ -71,7 +71,7 @@ func Pull(profileName, filePath string) error {
 	}
 
 	// Resolve absolute local path and derive relPath within context.
-	relPath := filepath.Base(filePath)
+	var relPath string
 	absFile, _ := filepath.Abs(filePath)
 
 	rel, relErr := filepath.Rel(profile.Context, absFile)

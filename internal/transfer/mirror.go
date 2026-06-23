@@ -488,7 +488,9 @@ func executeDown(client RemoteClient, profile *config.Profile, actions []MirrorE
 
 		case ActionDeleteDir:
 			localPath := filepath.Join(profile.Context, action.RelPath)
-			if err := os.RemoveAll(localPath); err != nil {
+			// os.Remove only removes empty directories — protects local-only files
+			// that were never synced from silent deletion.
+			if err := os.Remove(localPath); err != nil {
 				result.Warnings = append(result.Warnings,
 					fmt.Sprintf("rmdir %s: %v", action.RelPath, err))
 			} else {

@@ -18,7 +18,7 @@ func InstallDaemon() error {
 
 	// Check systemd
 	if !deps.Check("systemctl") {
-		return fmt.Errorf("systemd not found. Daemon mode requires systemd.")
+		return fmt.Errorf("systemd not found — daemon mode requires systemd")
 	}
 	fmt.Println("  ✓ systemd found")
 
