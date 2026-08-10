@@ -42,7 +42,7 @@ func findContext(profile *config.Profile, filePath string) (string, error) {
 // resolveProfile is the common setup shared by Up, Down, Diff, Push, and Pull:
 // checks deps, loads config, resolves profile, and auto-detects context.
 func resolveProfile(profileName, contextFile string) (*config.Profile, error) {
-	if err := deps.CheckRequired("notify-send"); err != nil {
+	if err := deps.CheckRequired(notify.RequiredDep()); err != nil {
 		notify.Error("SFTP Sync Error", err.Error())
 		return nil, err
 	}

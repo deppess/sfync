@@ -10,17 +10,19 @@ import (
 
 const version = "3.1.0"
 
-func main() {
-	// Linux-only check
+// requireLinux gates the subcommands that genuinely need Linux-specific
+// features (FUSE mounting, systemd). Sync commands (push/pull/up/down/diff/
+// current) are plain SFTP/FTP and work on any OS, so they're not gated here.
+func requireLinux(feature, reason string) {
 	if runtime.GOOS != "linux" {
-		fmt.Fprintf(os.Stderr, "Error: sfync is Linux-only\n")
+		fmt.Fprintf(os.Stderr, "Error: `sfync %s` is Linux-only\n", feature)
 		fmt.Fprintf(os.Stderr, "Current OS: %s\n", runtime.GOOS)
-		fmt.Fprintf(os.Stderr, "\nThis tool requires Linux-specific features:\n")
-		fmt.Fprintf(os.Stderr, "  - FUSE filesystem support (sshfs/rclone)\n")
-		fmt.Fprintf(os.Stderr, "  - notify-send (libnotify)\n")
+		fmt.Fprintf(os.Stderr, "\nThis command requires: %s\n", reason)
 		os.Exit(1)
 	}
+}
 
+func main() {
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
@@ -103,6 +105,7 @@ func main() {
 		}
 
 	case "mount":
+		requireLinux("mount", "FUSE filesystem support (sshfs/rclone)")
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: sfync mount <profile> [--yazi]")
 			os.Exit(1)
@@ -117,6 +120,7 @@ func main() {
 		}
 
 	case "unmount":
+		requireLinux("unmount", "FUSE filesystem support (sshfs/rclone)")
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: sfync unmount <profile|--all>")
 			os.Exit(1)
@@ -132,35 +136,41 @@ func main() {
 		}
 
 	case "mounts":
+		requireLinux("mounts", "FUSE filesystem support (sshfs/rclone)")
 		if err := cmd.Mounts(); err != nil {
 			os.Exit(1)
 		}
 
 	case "daemon":
+		requireLinux("daemon", "notify-send (libnotify) and a filesystem watcher tuned for Linux")
 		if err := cmd.Daemon(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 
 	case "install-daemon":
+		requireLinux("install-daemon", "systemd (user service)")
 		if err := cmd.InstallDaemon(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 
 	case "uninstall-daemon":
+		requireLinux("uninstall-daemon", "systemd (user service)")
 		if err := cmd.UninstallDaemon(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 
 	case "on":
+		requireLinux("on", "systemd (user service)")
 		if err := cmd.StartDaemon(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 
 	case "off":
+		requireLinux("off", "systemd (user service)")
 		if err := cmd.StopDaemon(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
