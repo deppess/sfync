@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/deppess/sfync/internal/config"
-	"github.com/deppess/sfync/internal/deps"
 	"github.com/deppess/sfync/internal/notify"
 	"github.com/deppess/sfync/internal/transfer"
 )
@@ -42,7 +41,7 @@ func findContext(profile *config.Profile, filePath string) (string, error) {
 // resolveProfile is the common setup shared by Up, Down, Diff, Push, and Pull:
 // checks deps, loads config, resolves profile, and auto-detects context.
 func resolveProfile(profileName, contextFile string) (*config.Profile, error) {
-	if err := deps.CheckRequired(notify.RequiredDep()); err != nil {
+	if err := notify.EnsureReady(); err != nil {
 		notify.Error("SFTP Sync Error", err.Error())
 		return nil, err
 	}

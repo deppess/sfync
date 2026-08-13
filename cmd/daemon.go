@@ -10,7 +10,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"github.com/deppess/sfync/internal/config"
-	"github.com/deppess/sfync/internal/deps"
+	"github.com/deppess/sfync/internal/notify"
 	"github.com/deppess/sfync/internal/transfer"
 	"github.com/deppess/sfync/internal/watcher"
 )
@@ -18,7 +18,7 @@ import (
 // Daemon runs the auto-sync daemon
 func Daemon() error {
 	// Check dependencies
-	if err := deps.CheckRequired("notify-send"); err != nil {
+	if err := notify.EnsureReady(); err != nil {
 		return err
 	}
 

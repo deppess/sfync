@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/deppess/sfync/internal/config"
@@ -49,6 +50,17 @@ func IsMounted(profileName string, profile *config.Profile) bool {
 	mountPoint, err := GetMountPoint(profileName, profile)
 	if err != nil {
 		return false
+	}
+
+	if runtime.GOOS == "darwin" {
+		// macOS has no `mountpoint` command — parse `mount` output instead.
+		// Entries look like: "sfync: on /path/to/mnt (nfs, ...)"
+		out, err := exec.Command("mount").Output()
+		if err != nil {
+			return false
+		}
+		needle := " on " + mountPoint + " ("
+		return strings.Contains(string(out), needle)
 	}
 
 	// Check using mountpoint command
@@ -112,8 +124,10 @@ func Mount(profileName string, profile *config.Profile) error {
 		return fmt.Errorf("failed to create mount point: %w", err)
 	}
 
-	// Mount based on protocol
-	if profile.Protocol == "sftp" {
+	// Mount based on protocol. macOS Homebrew's rclone has no FUSE support,
+	// so darwin always mounts via rclone nfsmount; Linux keeps sftp on
+	// sshfs, ftp on rclone FUSE.
+	if runtime.GOOS != "darwin" && profile.Protocol == "sftp" {
 		err = mountSSHFS(profile, mountPoint)
 	} else {
 		err = mountRclone(profile, mountPoint)
@@ -150,10 +164,19 @@ func Unmount(profileName string, profile *config.Profile) error {
 		return fmt.Errorf("profile '%s' is not mounted", profileName)
 	}
 
-	// Force unmount using fusermount
-	cmd := exec.Command("fusermount", "-uz", mountPoint)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("unmount failed: %w", err)
+	if runtime.GOOS == "darwin" {
+		// macOS has no fusermount — plain umount, retrying with -f if busy.
+		if err := exec.Command("umount", mountPoint).Run(); err != nil {
+			if err := exec.Command("umount", "-f", mountPoint).Run(); err != nil {
+				return fmt.Errorf("unmount failed: %w", err)
+			}
+		}
+	} else {
+		// Force unmount using fusermount
+		cmd := exec.Command("fusermount", "-uz", mountPoint)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("unmount failed: %w", err)
+		}
 	}
 
 	// Only remove the directory if sfync created it (~/.mounted/<name>).

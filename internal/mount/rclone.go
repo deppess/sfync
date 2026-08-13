@@ -9,16 +9,49 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 
 	"github.com/deppess/sfync/internal/config"
 )
 
-// mountRclone mounts using rclone.
-func mountRclone(profile *config.Profile, mountPoint string) error {
+// buildRcloneRemoteConfig generates the [sfync] remote stanza for the
+// profile's protocol. sftp mirrors the key-first/password-fallback
+// precedence used by internal/transfer/sftp.go; ftp is password-only, as
+// it always has been.
+func buildRcloneRemoteConfig(profile *config.Profile) (string, error) {
+	if profile.Protocol == "sftp" {
+		var authLine string
+		if profile.SSHKey != "" {
+			authLine = fmt.Sprintf("key_file = %s\n", profile.SSHKey)
+		} else {
+			obscuredPass, err := obscurePassword(profile.Password)
+			if err != nil {
+				return "", fmt.Errorf("failed to obscure password: %w", err)
+			}
+			authLine = fmt.Sprintf("pass = %s\n", obscuredPass)
+		}
+		return fmt.Sprintf("[sfync]\ntype = sftp\nhost = %s\nuser = %s\nport = %d\n%s",
+			profile.Host, profile.Username, profile.Port, authLine), nil
+	}
+
 	obscuredPass, err := obscurePassword(profile.Password)
 	if err != nil {
-		return fmt.Errorf("failed to obscure password: %w", err)
+		return "", fmt.Errorf("failed to obscure password: %w", err)
+	}
+	return fmt.Sprintf("[sfync]\ntype = ftp\nhost = %s\nuser = %s\npass = %s\nport = %d\n",
+		profile.Host, profile.Username, obscuredPass, profile.Port), nil
+}
+
+// mountRclone mounts using rclone. On Linux this uses the FUSE-backed
+// `rclone mount`. macOS Homebrew builds of rclone don't ship FUSE support,
+// so darwin uses `rclone nfsmount` instead (a local NFS server rclone runs
+// itself — no macFUSE kernel extension required). Both subcommands accept
+// the same flags and are torn down the same way (plain `umount`).
+func mountRclone(profile *config.Profile, mountPoint string) error {
+	remoteConfig, err := buildRcloneRemoteConfig(profile)
+	if err != nil {
+		return err
 	}
 
 	// Write a named-remote config with mode 0600 so credentials are not visible
@@ -37,15 +70,19 @@ func mountRclone(profile *config.Profile, mountPoint string) error {
 		return fmt.Errorf("failed to secure temp config: %w", err)
 	}
 
-	_, writeErr := fmt.Fprintf(tmpCfg, "[sfync]\ntype = ftp\nhost = %s\nuser = %s\npass = %s\nport = %d\n",
-		profile.Host, profile.Username, obscuredPass, profile.Port)
+	_, writeErr := tmpCfg.WriteString(remoteConfig)
 	tmpCfg.Close()
 	if writeErr != nil {
 		return fmt.Errorf("failed to write temp config: %w", writeErr)
 	}
 
+	mountSubcommand := "mount"
+	if runtime.GOOS == "darwin" {
+		mountSubcommand = "nfsmount"
+	}
+
 	args := []string{
-		"mount",
+		mountSubcommand,
 		"sfync:" + profile.RemotePath,
 		mountPoint,
 		"--config", tmpName,
@@ -63,7 +100,8 @@ func mountRclone(profile *config.Profile, mountPoint string) error {
 		if strings.Contains(errMsg, "connection refused") {
 			return fmt.Errorf("connection refused to %s:%d", profile.Host, profile.Port)
 		}
-		if strings.Contains(errMsg, "Login incorrect") || strings.Contains(errMsg, "530") {
+		if strings.Contains(errMsg, "Login incorrect") || strings.Contains(errMsg, "530") ||
+			strings.Contains(errMsg, "unable to authenticate") || strings.Contains(errMsg, "Permission denied") {
 			return fmt.Errorf("authentication failed for %s@%s", profile.Username, profile.Host)
 		}
 		if strings.Contains(errMsg, "No such file") {
