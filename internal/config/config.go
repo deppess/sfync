@@ -45,8 +45,12 @@ func Load() (*Config, error) {
 	}
 
 	// Check if config file exists
-	if _, err := os.Stat(configPath); errors.Is(err, fs.ErrNotExist) {
+	info, err := os.Stat(configPath)
+	if errors.Is(err, fs.ErrNotExist) {
 		return nil, fmt.Errorf("%w: %s", ErrConfigNotFound, configPath)
+	}
+	if err == nil {
+		warnIfInsecurePermissions(configPath, info)
 	}
 
 	// Read config file
@@ -81,6 +85,19 @@ func Load() (*Config, error) {
 	}
 
 	return config, nil
+}
+
+// warnIfInsecurePermissions warns (non-fatally) when the config file is
+// readable or writable by anyone other than its owner. Profiles can hold
+// plaintext passwords, so this is worth flagging even though the README
+// already recommends `chmod 600`.
+func warnIfInsecurePermissions(configPath string, info os.FileInfo) {
+	if info.Mode().Perm()&0o077 != 0 {
+		fmt.Fprintf(os.Stderr,
+			"Warning: %s is readable by other users on this system (mode %04o).\n"+
+				"  It may contain plaintext passwords — fix with: chmod 600 %s\n",
+			configPath, info.Mode().Perm(), configPath)
+	}
 }
 
 // GetProfile retrieves a profile by name

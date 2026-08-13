@@ -142,9 +142,9 @@ func TestDiffTrees_Upload(t *testing.T) {
 
 func TestDiffTrees_Download(t *testing.T) {
 	local := map[string]localEntry{
-		"existing.txt":  {info: mockFileInfo{size: 100, modTime: epoch}},
+		"existing.txt":   {info: mockFileInfo{size: 100, modTime: epoch}},
 		"local-only.txt": {info: mockFileInfo{size: 50, modTime: epoch}},
-		"local-dir":     {info: mockFileInfo{isDir: true}},
+		"local-dir":      {info: mockFileInfo{isDir: true}},
 	}
 	remote := map[string]*RemoteFileInfo{
 		"existing.txt":   {Size: 100, ModTime: epoch},
