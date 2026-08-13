@@ -1,19 +1,32 @@
 # sfync
 
-SFTP/FTP sync, mounting, and auto-upload daemon for Linux — bidirectional mirror sync, single-file push/pull, FUSE mounting, and editor integration.
+SFTP/FTP sync, mounting, and auto-upload daemon for Linux and macOS — bidirectional mirror sync, single-file push/pull, mounting, and editor integration.
 
 ## Dependencies
+
+Linux:
 
 ```
 libnotify
 sshfs  rclone   # mounting only
 ```
 
+macOS:
+
+```
+rclone   # mounting only — both sftp and ftp profiles mount via `rclone nfsmount`.
+         # Homebrew's rclone has no FUSE support on macOS, so sshfs/macFUSE
+         # are not used and not needed.
+```
+
+Install with `brew install rclone`. Desktop notifications ship as a bundled helper app (embedded in the `sfync` binary, extracted on first use) — no extra install needed. `sfync install-daemon` prompts macOS for notification permission once; grant it and notifications work from the background daemon from then on.
+
 ## Install
 
 ```bash
 go build -o sfync .
-sudo cp sfync /usr/local/bin/sfync
+sudo cp sfync /usr/local/bin/sfync    # Linux, or macOS on Intel
+cp sfync /opt/homebrew/bin/sfync      # macOS on Apple Silicon
 ```
 
 ## Config
@@ -52,7 +65,7 @@ sfync current <profile> <file>  upload by absolute path (editor integration)
 ```
 
 ```
-sfync mount <profile>           mount remote via FUSE
+sfync mount <profile>           mount remote filesystem
 sfync mount <profile> --yazi    mount and open in yazi
 sfync unmount <profile>         unmount
 sfync unmount --all             unmount everything
@@ -60,8 +73,8 @@ sfync mounts                    list active mounts
 ```
 
 ```
-sfync install-daemon            install systemd user service
-sfync uninstall-daemon          remove systemd user service
+sfync install-daemon            install background service (systemd on Linux, launchd on macOS)
+sfync uninstall-daemon          remove background service
 sfync on                        start the daemon
 sfync off                       stop the daemon
 ```
@@ -84,8 +97,17 @@ Ignored directories are skipped by the file watcher. Changes to `.syncignore` ar
 
 Watches all profiles with `autoSync: true`. Debounces per-file, retries with exponential backoff, batches desktop notifications, and hot-reloads config on save.
 
+Linux: `install-daemon` creates a systemd user unit. Enable it with `systemctl --user enable sfync` to auto-start at login.
+
 ```bash
 journalctl --user -u sfync -f
+```
+
+macOS: `install-daemon` creates a launchd LaunchAgent (`~/Library/LaunchAgents/com.deppess.sfync.plist`), which auto-starts at every login on its own — no separate enable step.
+
+```bash
+tail -f ~/Library/Logs/sfync.log
+tail -f ~/Library/Logs/sfync.error.log
 ```
 
 ## Editor Integration
