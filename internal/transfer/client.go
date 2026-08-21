@@ -104,6 +104,22 @@ func RemotePath(parts ...string) string {
 	return path.Join(parts...)
 }
 
+// isSafeEntryName reports whether a directory-entry name returned by the
+// remote server is safe to treat as a single path component. Protocol-level
+// filenames are attacker-controlled input from the server's point of view —
+// a malicious or compromised SFTP/FTP server can return an entry named
+// e.g. "../../../home/user/.ssh/authorized_keys" in a directory listing.
+// Every consumer of ReadDir joins entry names into local (mirror down) and
+// remote (mirror up) paths, so entries that aren't a plain single component
+// are rejected here, at the source, rather than trusted downstream — the
+// same class of bug as "zip slip" in archive extractors.
+func isSafeEntryName(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	return !strings.ContainsAny(name, "/\\")
+}
+
 // HumanSize formats a byte count into a human-readable string
 func HumanSize(bytes int64) string {
 	if bytes < 1024 {
@@ -142,6 +158,11 @@ func translateError(err error) string {
 	}
 	if strings.Contains(msg, "broken pipe") {
 		return "Connection lost"
+	}
+
+	// TLS errors (ftps)
+	if strings.Contains(msg, "x509:") || strings.Contains(msg, "tls:") {
+		return "TLS error: " + msg
 	}
 
 	// Auth errors

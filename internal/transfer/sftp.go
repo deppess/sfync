@@ -175,6 +175,12 @@ func (c *sftpClient) ReadDir(remotePath string) ([]RemoteFileInfo, error) {
 		if entry.Mode()&os.ModeSymlink != 0 {
 			continue
 		}
+		// Reject entry names that aren't a plain path component — see
+		// isSafeEntryName for why a server can't be trusted here.
+		if !isSafeEntryName(entry.Name()) {
+			fmt.Fprintf(os.Stderr, "  warning: skipping unsafe remote entry name %q in %s\n", entry.Name(), remotePath)
+			continue
+		}
 		result = append(result, *fileInfoToRemote(entry, ""))
 	}
 	return result, nil
@@ -336,6 +342,14 @@ func (c *sftpClient) Download(remotePath, localPath string) error {
 		return wrapError("download", err)
 	}
 	defer remote.Close()
+
+	// If a symlink already exists at this path, remove it first — os.Create
+	// would otherwise follow it and write through to wherever it points. A
+	// local attacker with write access to the sync directory could plant
+	// such a symlink to redirect a download to an arbitrary location.
+	if fi, lerr := os.Lstat(localPath); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+		os.Remove(localPath)
+	}
 
 	// Create local (truncate if exists)
 	local, err := os.Create(localPath)

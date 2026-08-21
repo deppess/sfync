@@ -29,7 +29,7 @@ func (p *Profile) Validate() error {
 		return ErrMissingUsername
 	}
 	// Validate protocol
-	if p.Protocol != "ftp" && p.Protocol != "sftp" {
+	if p.Protocol != "ftp" && p.Protocol != "ftps" && p.Protocol != "sftp" {
 		return ErrInvalidProtocol
 	}
 	// Validate port
@@ -42,7 +42,7 @@ func (p *Profile) Validate() error {
 			return ErrMissingPasswordOrKey
 		}
 	} else {
-		// For FTP, password is still required
+		// For FTP/FTPS, password is still required
 		if p.Password == "" {
 			return ErrMissingPassword
 		}
