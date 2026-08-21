@@ -19,16 +19,19 @@ func Push(profileName, filePath string) error {
 	}
 
 	// Resolve absolute path and compute relative path within context
-	relPath := filepath.Base(filePath)
 	absFile, err := filepath.Abs(filePath)
-	if err == nil {
-		if rel, err := filepath.Rel(profile.Context, absFile); err == nil {
-			relPath = rel
-		}
+	if err != nil {
+		notify.Error("SFTP Error", fmt.Sprintf("cannot resolve path '%s': %s", filePath, err))
+		return fmt.Errorf("cannot resolve path '%s': %w", filePath, err)
+	}
+
+	relPath := filepath.Base(filePath)
+	if rel, err := filepath.Rel(profile.Context, absFile); err == nil {
+		relPath = rel
 	}
 
 	// Check file is within context
-	if absFile != "" && !strings.HasPrefix(absFile, profile.Context+"/") && absFile != profile.Context {
+	if !strings.HasPrefix(absFile, profile.Context+"/") && absFile != profile.Context {
 		notify.Error("SFTP Error", fmt.Sprintf("file '%s' is not within context '%s'", absFile, profile.Context))
 		return fmt.Errorf("file '%s' is not within context '%s'", absFile, profile.Context)
 	}
@@ -49,6 +52,10 @@ func Push(profileName, filePath string) error {
 	defer client.Close()
 
 	remotePath := path.Join(profile.RemotePath, filepath.ToSlash(relPath))
+	if err := client.MkdirAll(path.Dir(remotePath)); err != nil {
+		notify.Error("SFTP Error", fmt.Sprintf("Failed to create remote directory for %s", relPath))
+		return err
+	}
 	if err := client.Upload(absFile, remotePath); err != nil {
 		notify.Error("SFTP Error", fmt.Sprintf("Failed to upload %s", relPath))
 		return err

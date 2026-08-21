@@ -237,6 +237,8 @@ func diffTrees(local map[string]localEntry, remote map[string]*RemoteFileInfo, u
 			if entry.info.IsDir() {
 				if !existsRemote {
 					actions = append(actions, MirrorEntry{Action: ActionMkdir, RelPath: relPath})
+				} else if !remoteEntry.IsDir {
+					actions = append(actions, MirrorEntry{Action: ActionConflict, RelPath: relPath})
 				}
 				continue
 			}
@@ -248,6 +250,8 @@ func diffTrees(local map[string]localEntry, remote map[string]*RemoteFileInfo, u
 					LocalInfo: entry.info,
 					IsNew:     true,
 				})
+			} else if remoteEntry.IsDir {
+				actions = append(actions, MirrorEntry{Action: ActionConflict, RelPath: relPath})
 			} else if isDifferent(entry.info, remoteEntry) {
 				actions = append(actions, MirrorEntry{
 					Action:     ActionUpload,
@@ -281,6 +285,8 @@ func diffTrees(local map[string]localEntry, remote map[string]*RemoteFileInfo, u
 			if remoteEntry.IsDir {
 				if !existsLocal {
 					actions = append(actions, MirrorEntry{Action: ActionMkdir, RelPath: relPath})
+				} else if !localEntry.info.IsDir() {
+					actions = append(actions, MirrorEntry{Action: ActionConflict, RelPath: relPath})
 				}
 				continue
 			}
@@ -292,6 +298,8 @@ func diffTrees(local map[string]localEntry, remote map[string]*RemoteFileInfo, u
 					RemoteInfo: remoteEntry,
 					IsNew:      true,
 				})
+			} else if localEntry.info.IsDir() {
+				actions = append(actions, MirrorEntry{Action: ActionConflict, RelPath: relPath})
 			} else if isDifferent(localEntry.info, remoteEntry) {
 				actions = append(actions, MirrorEntry{
 					Action:     ActionDownload,
@@ -341,7 +349,7 @@ func isDifferent(local os.FileInfo, remote *RemoteFileInfo) bool {
 // 3. Delete files (any order)
 // 4. DeleteDir (deepest first — children before parents)
 func sortActions(actions []MirrorEntry) []MirrorEntry {
-	var mkdirs, transfers, deletes, deleteDirs []MirrorEntry
+	var mkdirs, transfers, deletes, deleteDirs, conflicts []MirrorEntry
 
 	for _, a := range actions {
 		switch a.Action {
@@ -353,6 +361,8 @@ func sortActions(actions []MirrorEntry) []MirrorEntry {
 			deletes = append(deletes, a)
 		case ActionDeleteDir:
 			deleteDirs = append(deleteDirs, a)
+		case ActionConflict:
+			conflicts = append(conflicts, a)
 			// ActionSkip is not included in output
 		}
 	}
@@ -372,6 +382,7 @@ func sortActions(actions []MirrorEntry) []MirrorEntry {
 	result = append(result, transfers...)
 	result = append(result, deletes...)
 	result = append(result, deleteDirs...)
+	result = append(result, conflicts...)
 	return result
 }
 
@@ -433,6 +444,11 @@ func executeUp(client RemoteClient, profile *config.Profile, actions []MirrorEnt
 				result.Deleted++
 				fmt.Fprintf(os.Stderr, "  - rmdir: %s/\n", action.RelPath)
 			}
+
+		case ActionConflict:
+			result.Warnings = append(result.Warnings,
+				fmt.Sprintf("skipped %s: file on one side, directory on the other — resolve manually", action.RelPath))
+			fmt.Fprintf(os.Stderr, "  ! conflict (file vs directory), skipping: %s\n", action.RelPath)
 		}
 	}
 }
@@ -497,6 +513,11 @@ func executeDown(client RemoteClient, profile *config.Profile, actions []MirrorE
 				result.Deleted++
 				fmt.Fprintf(os.Stderr, "  - rmdir: %s/\n", action.RelPath)
 			}
+
+		case ActionConflict:
+			result.Warnings = append(result.Warnings,
+				fmt.Sprintf("skipped %s: file on one side, directory on the other — resolve manually", action.RelPath))
+			fmt.Fprintf(os.Stderr, "  ! conflict (file vs directory), skipping: %s\n", action.RelPath)
 		}
 	}
 }

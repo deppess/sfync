@@ -232,6 +232,9 @@ func Diff(direction, profileName, contextFile string) error {
 		case transfer.ActionDeleteDir:
 			fmt.Printf("  - %s/\n", entry.RelPath)
 			changes++
+		case transfer.ActionConflict:
+			fmt.Printf("  ! %s (conflict: file vs directory — resolve manually)\n", entry.RelPath)
+			changes++
 		}
 	}
 

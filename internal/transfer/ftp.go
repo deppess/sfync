@@ -5,7 +5,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -105,7 +104,11 @@ func (c *ftpClient) ReadDir(remotePath string) ([]RemoteFileInfo, error) {
 	return result, nil
 }
 
-// Upload streams a local file to the remote server
+// Upload streams a local file to the remote server. The remote directory
+// must already exist — callers are responsible for calling MkdirAll first
+// (mirror.go pre-creates directories in a dedicated phase before any
+// transfers run; single-file callers like Push and the auto-sync queue call
+// MkdirAll explicitly before Upload/UploadResume).
 func (c *ftpClient) Upload(localPath, remotePath string) error {
 	local, err := os.Open(localPath)
 	if err != nil {
@@ -116,12 +119,6 @@ func (c *ftpClient) Upload(localPath, remotePath string) error {
 	localInfo, err := local.Stat()
 	if err != nil {
 		return wrapError("upload", err)
-	}
-
-	// Ensure remote directory exists
-	remoteDir := path.Dir(remotePath)
-	if err := c.MkdirAll(remoteDir); err != nil {
-		return wrapError("upload", fmt.Errorf("cannot create directory %s: %w", remoteDir, err))
 	}
 
 	// FTP Stor
