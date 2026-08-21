@@ -179,6 +179,76 @@ func TestDiffTrees_Empty(t *testing.T) {
 	}
 }
 
+func TestDiffTrees_TypeConflict(t *testing.T) {
+	t.Run("upload: local file, remote dir", func(t *testing.T) {
+		local := map[string]localEntry{
+			"foo": {info: mockFileInfo{name: "foo", size: 10, modTime: epoch}},
+		}
+		remote := map[string]*RemoteFileInfo{
+			"foo": {IsDir: true},
+		}
+		actions := diffTrees(local, remote, true)
+		counts := actionCounts(actions)
+		if counts[ActionConflict] != 1 {
+			t.Errorf("conflicts = %d, want 1", counts[ActionConflict])
+		}
+		if counts[ActionUpload] != 0 {
+			t.Errorf("uploads = %d, want 0 (should not attempt to overwrite a directory)", counts[ActionUpload])
+		}
+	})
+
+	t.Run("upload: local dir, remote file", func(t *testing.T) {
+		local := map[string]localEntry{
+			"foo": {info: mockFileInfo{name: "foo", isDir: true}},
+		}
+		remote := map[string]*RemoteFileInfo{
+			"foo": {IsDir: false},
+		}
+		actions := diffTrees(local, remote, true)
+		counts := actionCounts(actions)
+		if counts[ActionConflict] != 1 {
+			t.Errorf("conflicts = %d, want 1", counts[ActionConflict])
+		}
+		if counts[ActionMkdir] != 0 {
+			t.Errorf("mkdirs = %d, want 0 (should not attempt to mkdir over a file)", counts[ActionMkdir])
+		}
+	})
+
+	t.Run("download: remote file, local dir", func(t *testing.T) {
+		local := map[string]localEntry{
+			"foo": {info: mockFileInfo{name: "foo", isDir: true}},
+		}
+		remote := map[string]*RemoteFileInfo{
+			"foo": {IsDir: false},
+		}
+		actions := diffTrees(local, remote, false)
+		counts := actionCounts(actions)
+		if counts[ActionConflict] != 1 {
+			t.Errorf("conflicts = %d, want 1", counts[ActionConflict])
+		}
+		if counts[ActionDownload] != 0 {
+			t.Errorf("downloads = %d, want 0 (should not attempt to overwrite a directory)", counts[ActionDownload])
+		}
+	})
+
+	t.Run("download: remote dir, local file", func(t *testing.T) {
+		local := map[string]localEntry{
+			"foo": {info: mockFileInfo{name: "foo", size: 10, modTime: epoch}},
+		}
+		remote := map[string]*RemoteFileInfo{
+			"foo": {IsDir: true},
+		}
+		actions := diffTrees(local, remote, false)
+		counts := actionCounts(actions)
+		if counts[ActionConflict] != 1 {
+			t.Errorf("conflicts = %d, want 1", counts[ActionConflict])
+		}
+		if counts[ActionMkdir] != 0 {
+			t.Errorf("mkdirs = %d, want 0 (should not attempt to mkdir over a file)", counts[ActionMkdir])
+		}
+	})
+}
+
 // ── sortActions ───────────────────────────────────────────────────────────────
 
 func TestSortActions(t *testing.T) {

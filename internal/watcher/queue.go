@@ -142,6 +142,21 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 			continue
 		}
 
+		// Upload/UploadResume assume the remote directory already exists —
+		// ensure it does before every attempt (cheap no-op once created).
+		if mkErr := client.MkdirAll(path.Dir(remotePath)); mkErr != nil {
+			lastErr = mkErr
+			if attempt < maxRetries-1 {
+				fmt.Fprintf(os.Stderr, "Directory creation failed (attempt %d/%d): %s - %v\n", attempt+1, maxRetries, relPath, mkErr)
+				select {
+				case <-time.After(delays[attempt]):
+				case <-q.done:
+					return
+				}
+			}
+			continue
+		}
+
 		// Use resume for large files (mirrors mirror.go behaviour)
 		var uploadErr error
 		if fi, statErr := os.Stat(absFile); statErr == nil && fi.Size() >= transfer.ResumeThreshold {

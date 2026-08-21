@@ -32,6 +32,7 @@ const (
 	ActionDeleteDir
 	ActionMkdir
 	ActionSkip
+	ActionConflict // same path is a file on one side and a directory on the other
 )
 
 // MirrorEntry represents a single action in a mirror operation

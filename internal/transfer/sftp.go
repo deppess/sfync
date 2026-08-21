@@ -5,7 +5,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -181,7 +180,11 @@ func (c *sftpClient) ReadDir(remotePath string) ([]RemoteFileInfo, error) {
 	return result, nil
 }
 
-// Upload streams a local file to the remote server
+// Upload streams a local file to the remote server. The remote directory
+// must already exist — callers are responsible for calling MkdirAll first
+// (mirror.go pre-creates directories in a dedicated phase before any
+// transfers run; single-file callers like Push and the auto-sync queue call
+// MkdirAll explicitly before Upload/UploadResume).
 func (c *sftpClient) Upload(localPath, remotePath string) error {
 	// Open and stat local file
 	local, err := os.Open(localPath)
@@ -198,12 +201,6 @@ func (c *sftpClient) Upload(localPath, remotePath string) error {
 	// Set deadline proportional to file size
 	c.setDeadline(TransferTimeout(localInfo.Size()))
 	defer c.clearDeadline()
-
-	// Ensure remote directory exists
-	remoteDir := path.Dir(remotePath)
-	if err := c.MkdirAll(remoteDir); err != nil {
-		return wrapError("upload", fmt.Errorf("cannot create directory %s: %w", remoteDir, err))
-	}
 
 	// Create remote file
 	remote, err := c.sftpClient.Create(remotePath)
