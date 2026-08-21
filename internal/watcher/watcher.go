@@ -18,11 +18,18 @@ import (
 
 // Watcher watches file changes for auto-sync
 type Watcher struct {
-	fsWatcher     *fsnotify.Watcher
-	debouncer     *Debouncer
+	fsWatcher *fsnotify.Watcher
+	debouncer *Debouncer
+
+	// profiles/callbacks/contextDepths are written by Watch/Unwatch (called
+	// from the daemon's config-reload goroutine) and read by the fsnotify
+	// event-processing goroutine started in Start() — both run concurrently
+	// once the daemon is up, so all access must go through profilesMu.
 	profiles      map[string]*config.Profile // profile name -> profile
 	callbacks     map[string]func(string)    // profile name -> upload callback
 	contextDepths map[string]int             // profile name -> path separator count (precomputed)
+	profilesMu    sync.RWMutex
+
 	// syncignore cache: context path -> parsed patterns.
 	// Invalidated when fsnotify fires a Write/Create on the .syncignore file.
 	syncignoreCache   map[string][]string
@@ -81,9 +88,11 @@ func (w *Watcher) Watch(profileName string, profile *config.Profile, callback fu
 	}
 
 	// Store profile, callback, and precomputed context depth
+	w.profilesMu.Lock()
 	w.profiles[profileName] = profile
 	w.callbacks[profileName] = callback
 	w.contextDepths[profileName] = strings.Count(profile.Context, string(os.PathSeparator))
+	w.profilesMu.Unlock()
 
 	// Add context directory to watcher (recursively)
 	if err := w.addRecursive(profile.Context); err != nil {
@@ -134,7 +143,9 @@ func (w *Watcher) addRecursive(root string) error {
 
 // Unwatch stops watching a profile
 func (w *Watcher) Unwatch(profileName string) error {
+	w.profilesMu.RLock()
 	profile, exists := w.profiles[profileName]
+	w.profilesMu.RUnlock()
 	if !exists {
 		return fmt.Errorf("profile not watched: %s", profileName)
 	}
@@ -145,9 +156,11 @@ func (w *Watcher) Unwatch(profileName string) error {
 	}
 
 	// Remove from maps
+	w.profilesMu.Lock()
 	delete(w.profiles, profileName)
 	delete(w.callbacks, profileName)
 	delete(w.contextDepths, profileName)
+	w.profilesMu.Unlock()
 
 	fmt.Fprintf(os.Stderr, "Stopped watching: %s\n", profileName)
 	return nil
@@ -218,16 +231,23 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 		// ignore it. Per-profile syncignore filtering happens at upload time, so
 		// we only skip watching when every matching profile explicitly ignores it.
 		if event.Op&fsnotify.Create == fsnotify.Create {
-			for _, profile := range w.profiles {
-				rel, relErr := filepath.Rel(profile.Context, filePath)
-				if relErr != nil || strings.HasPrefix(rel, "..") {
-					continue // filePath is not under this profile's context
+			shouldWatch := func() bool {
+				w.profilesMu.RLock()
+				defer w.profilesMu.RUnlock()
+				for _, profile := range w.profiles {
+					rel, relErr := filepath.Rel(profile.Context, filePath)
+					if relErr != nil || strings.HasPrefix(rel, "..") {
+						continue // filePath is not under this profile's context
+					}
+					patterns := w.getPatterns(profile.Context)
+					if !syncignore.ShouldIgnore(filepath.ToSlash(rel), patterns) {
+						return true
+					}
 				}
-				patterns := w.getPatterns(profile.Context)
-				if !syncignore.ShouldIgnore(filepath.ToSlash(rel), patterns) {
-					w.fsWatcher.Add(filePath) //nolint:errcheck // best-effort
-					return
-				}
+				return false
+			}()
+			if shouldWatch {
+				w.fsWatcher.Add(filePath) //nolint:errcheck // best-effort
 			}
 		}
 		return
@@ -240,6 +260,9 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 
 	// Find which profile(s) this file belongs to
 	matchedProfiles := w.findMatchingProfiles(filePath)
+
+	w.profilesMu.RLock()
+	defer w.profilesMu.RUnlock()
 
 	for _, profileName := range matchedProfiles {
 		profile := w.profiles[profileName]
@@ -261,6 +284,9 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 // findMatchingProfiles finds which profile(s) a file belongs to
 // Returns profile names sorted by context specificity (most specific first)
 func (w *Watcher) findMatchingProfiles(filePath string) []string {
+	w.profilesMu.RLock()
+	defer w.profilesMu.RUnlock()
+
 	var matches []struct {
 		name  string
 		depth int
