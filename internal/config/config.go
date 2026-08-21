@@ -80,11 +80,27 @@ func Load() (*Config, error) {
 		if err := profile.Validate(); err != nil {
 			return nil, fmt.Errorf("profile '%s': %w", name, err)
 		}
+		warnIfInsecureProfile(name, &profile)
 		// Update the profile with defaults
 		config.Profiles[name] = profile
 	}
 
 	return config, nil
+}
+
+// warnIfInsecureProfile warns (non-fatally) about profile settings that
+// weaken transport security: plain FTP sends credentials and file contents
+// unencrypted, and a disabled verifyHostKey removes protection against a
+// machine-in-the-middle presenting a different host key.
+func warnIfInsecureProfile(name string, p *Profile) {
+	if p.Protocol == "ftp" {
+		fmt.Fprintf(os.Stderr,
+			"Warning: profile '%s' uses plain FTP — credentials and file contents are sent unencrypted. Prefer 'sftp' where possible.\n", name)
+	}
+	if p.VerifyHostKey != nil && !*p.VerifyHostKey {
+		fmt.Fprintf(os.Stderr,
+			"Warning: profile '%s' has verifyHostKey disabled — vulnerable to machine-in-the-middle attacks.\n", name)
+	}
 }
 
 // warnIfInsecurePermissions warns (non-fatally) when the config file is
