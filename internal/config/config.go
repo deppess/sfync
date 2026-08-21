@@ -18,7 +18,7 @@ var (
 	ErrMissingUsername      = errors.New("missing required field: username")
 	ErrMissingPassword      = errors.New("missing required field: password")
 	ErrMissingPasswordOrKey = errors.New("missing required field: password or sshKey (at least one required for SFTP)")
-	ErrInvalidProtocol      = errors.New("invalid protocol: must be 'ftp' or 'sftp'")
+	ErrInvalidProtocol      = errors.New("invalid protocol: must be 'ftp', 'ftps', or 'sftp'")
 	ErrInvalidPort          = errors.New("invalid port: must be between 1 and 65535")
 	ErrProfileNotFound      = errors.New("profile not found in config")
 )

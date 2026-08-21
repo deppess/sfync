@@ -17,8 +17,10 @@ import (
 
 // buildRcloneRemoteConfig generates the [sfync] remote stanza for the
 // profile's protocol. sftp mirrors the key-first/password-fallback
-// precedence used by internal/transfer/sftp.go; ftp is password-only, as
-// it always has been.
+// precedence used by internal/transfer/sftp.go; ftp/ftps are password-only,
+// as ftp always has been — ftps additionally sets explicit_tls so rclone
+// upgrades the control connection to TLS (RFC 4217) before login, matching
+// internal/transfer/ftp.go's Connect().
 func buildRcloneRemoteConfig(profile *config.Profile) (string, error) {
 	if profile.Protocol == "sftp" {
 		var authLine string
@@ -39,8 +41,12 @@ func buildRcloneRemoteConfig(profile *config.Profile) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to obscure password: %w", err)
 	}
-	return fmt.Sprintf("[sfync]\ntype = ftp\nhost = %s\nuser = %s\npass = %s\nport = %d\n",
-		profile.Host, profile.Username, obscuredPass, profile.Port), nil
+	var tlsLine string
+	if profile.Protocol == "ftps" {
+		tlsLine = "explicit_tls = true\n"
+	}
+	return fmt.Sprintf("[sfync]\ntype = ftp\nhost = %s\nuser = %s\npass = %s\nport = %d\n%s",
+		profile.Host, profile.Username, obscuredPass, profile.Port, tlsLine), nil
 }
 
 // mountRclone mounts using rclone. On Linux this uses the FUSE-backed

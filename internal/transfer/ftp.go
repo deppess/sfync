@@ -1,6 +1,7 @@
 package transfer
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -25,7 +26,10 @@ func newFTPClient(profile *config.Profile) *ftpClient {
 	return &ftpClient{profile: profile}
 }
 
-// Connect establishes the FTP connection and logs in
+// Connect establishes the FTP connection and logs in. protocol "ftps" adds
+// explicit AUTH TLS (RFC 4217) — the control connection starts in
+// plaintext, then upgrades to TLS before the login exchange, so credentials
+// and file contents never go over the wire unencrypted.
 func (c *ftpClient) Connect() error {
 	// Safety: close existing connection if any
 	if c.conn != nil {
@@ -33,7 +37,13 @@ func (c *ftpClient) Connect() error {
 	}
 
 	addr := net.JoinHostPort(c.profile.Host, strconv.Itoa(c.profile.Port))
-	conn, err := ftp.Dial(addr, ftp.DialWithTimeout(DialTimeout))
+
+	dialOpts := []ftp.DialOption{ftp.DialWithTimeout(DialTimeout)}
+	if c.profile.Protocol == "ftps" {
+		dialOpts = append(dialOpts, ftp.DialWithExplicitTLS(&tls.Config{ServerName: c.profile.Host}))
+	}
+
+	conn, err := ftp.Dial(addr, dialOpts...)
 	if err != nil {
 		return wrapError("connect", err)
 	}
@@ -91,12 +101,15 @@ func (c *ftpClient) ReadDir(remotePath string) ([]RemoteFileInfo, error) {
 
 	var result []RemoteFileInfo
 	for _, entry := range entries {
-		// Skip . and ..
-		if entry.Name == "." || entry.Name == ".." {
-			continue
-		}
 		// Skip symlinks
 		if entry.Type == ftp.EntryTypeLink {
+			continue
+		}
+		// Reject entry names that aren't a plain path component (also
+		// covers "." and ".."). See isSafeEntryName for why a server
+		// can't be trusted here.
+		if !isSafeEntryName(entry.Name) {
+			fmt.Fprintf(os.Stderr, "  warning: skipping unsafe remote entry name %q in %s\n", entry.Name, remotePath)
 			continue
 		}
 		result = append(result, *ftpEntryToRemote(entry, ""))
@@ -195,6 +208,14 @@ func (c *ftpClient) Download(remotePath, localPath string) error {
 		return wrapError("download", err)
 	}
 	defer resp.Close()
+
+	// If a symlink already exists at this path, remove it first — os.Create
+	// would otherwise follow it and write through to wherever it points. A
+	// local attacker with write access to the sync directory could plant
+	// such a symlink to redirect a download to an arbitrary location.
+	if fi, lerr := os.Lstat(localPath); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+		os.Remove(localPath)
+	}
 
 	// Create local file
 	local, err := os.Create(localPath)

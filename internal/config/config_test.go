@@ -96,6 +96,8 @@ func TestValidate(t *testing.T) {
 		{"valid sftp with key", validSFTP(), nil},
 		{"valid sftp with password", Profile{Host: "h", Username: "u", Password: "p", Protocol: "sftp", Port: 22}, nil},
 		{"valid ftp", validFTP(), nil},
+		{"valid ftps", Profile{Host: "h", Username: "u", Password: "p", Protocol: "ftps", Port: 21}, nil},
+		{"ftps missing password", Profile{Host: "h", Username: "u", Protocol: "ftps", Port: 21}, ErrMissingPassword},
 		{"missing host", func() Profile { p := validSFTP(); p.Host = ""; return p }(), ErrMissingHost},
 		{"missing username", func() Profile { p := validSFTP(); p.Username = ""; return p }(), ErrMissingUsername},
 		{"sftp no auth", func() Profile { p := validSFTP(); p.SSHKey = ""; return p }(), ErrMissingPasswordOrKey},
