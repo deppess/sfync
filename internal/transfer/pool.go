@@ -29,11 +29,11 @@ func NewConnectionPool(profiles map[string]*config.Profile) *ConnectionPool {
 // If the existing connection is dead, it reconnects transparently.
 func (p *ConnectionPool) Get(profileName string) (RemoteClient, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	// Check existing connection
 	if client, ok := p.connections[profileName]; ok {
 		if client.IsAlive() {
+			p.mu.Unlock()
 			return client, nil
 		}
 		// Dead — close and discard
@@ -45,15 +45,27 @@ func (p *ConnectionPool) Get(profileName string) (RemoteClient, error) {
 	// Get profile
 	profile, ok := p.profiles[profileName]
 	if !ok {
+		p.mu.Unlock()
 		return nil, fmt.Errorf("unknown profile: %s", profileName)
 	}
+	p.mu.Unlock()
 
-	// New connection
+	// Dial outside the lock — Connect() can block up to DialTimeout, and
+	// holding the lock here would otherwise stall lookups for unrelated
+	// profiles behind this one's network I/O.
 	client := NewClient(profile)
 	if err := client.Connect(); err != nil {
 		return nil, err // already wrapped by Connect()
 	}
 
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Another goroutine may have raced us and already connected — prefer
+	// its live connection and close ours rather than leaking a socket.
+	if existing, ok := p.connections[profileName]; ok && existing.IsAlive() {
+		client.Close()
+		return existing, nil
+	}
 	p.connections[profileName] = client
 	return client, nil
 }
