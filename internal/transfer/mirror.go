@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/deppess/sfync/internal/config"
@@ -182,18 +183,45 @@ func walkLocal(localRoot string, patterns []string) (map[string]localEntry, erro
 	return entries, err
 }
 
-// walkRemote recursively lists the remote directory tree, applying syncignore
+// walkRemote recursively lists the remote directory tree, applying syncignore.
+//
+// SFTP connections multiplex requests over a single SSH channel (the client
+// is already configured with UseConcurrentReads/UseConcurrentWrites for
+// transfers, so concurrent request dispatch is known-safe), so listing
+// subdirectories in parallel is safe there and cuts scan time on
+// latency-bound links. FTP's control connection allows only one command in
+// flight at a time — issuing concurrent List calls on it would corrupt the
+// session — so FTP always walks serially.
 func walkRemote(client RemoteClient, remoteRoot string, patterns []string) (map[string]*RemoteFileInfo, error) {
 	entries := make(map[string]*RemoteFileInfo)
+	var mu sync.Mutex
 
-	var walk func(dir, relDir string) error
-	walk = func(dir, relDir string) error {
+	concurrent := supportsConcurrentRequests(client)
+	var sem chan struct{}
+	if concurrent {
+		sem = make(chan struct{}, MaxConcurrentReadDir)
+	}
+
+	type subdir struct{ dir, rel string }
+
+	var wg sync.WaitGroup
+	var walk func(dir, relDir string)
+	walk = func(dir, relDir string) {
+		defer wg.Done()
+
+		if concurrent {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+		}
+
 		items, err := client.ReadDir(dir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: cannot list %s: %v\n", dir, err)
-			return nil // warn and skip, don't abort entire walk
+			return // warn and skip, don't abort entire walk
 		}
 
+		var subdirs []subdir
+		mu.Lock()
 		for _, item := range items {
 			relPath := item.Name
 			if relDir != "" {
@@ -209,17 +237,27 @@ func walkRemote(client RemoteClient, remoteRoot string, patterns []string) (map[
 			info.Path = relPath
 			entries[relPath] = &info
 
-			// Recurse into directories
 			if item.IsDir {
-				if err := walk(dir+"/"+item.Name, relPath); err != nil {
-					return err
-				}
+				subdirs = append(subdirs, subdir{dir + "/" + item.Name, relPath})
 			}
 		}
-		return nil
+		mu.Unlock()
+
+		for _, sd := range subdirs {
+			wg.Add(1)
+			if concurrent {
+				go walk(sd.dir, sd.rel)
+			} else {
+				walk(sd.dir, sd.rel)
+			}
+		}
 	}
 
-	return entries, walk(remoteRoot, "")
+	wg.Add(1)
+	walk(remoteRoot, "")
+	wg.Wait()
+
+	return entries, nil
 }
 
 // diffTrees compares local and remote trees, producing an action list.
@@ -386,8 +424,13 @@ func sortActions(actions []MirrorEntry) []MirrorEntry {
 	return result
 }
 
-// executeUp applies mirror-up actions (local → remote)
+// executeUp applies mirror-up actions (local → remote). Mkdir/delete/rmdir/
+// conflict actions run inline as encountered; upload actions are collected
+// and handed to runTransfers so they can run in parallel when the client
+// supports it.
 func executeUp(client RemoteClient, profile *config.Profile, actions []MirrorEntry, result *MirrorResult) {
+	var transferActions []MirrorEntry
+
 	for _, action := range actions {
 		switch action.Action {
 		case ActionSkip:
@@ -404,26 +447,7 @@ func executeUp(client RemoteClient, profile *config.Profile, actions []MirrorEnt
 			}
 
 		case ActionUpload:
-			localPath := filepath.Join(profile.Context, action.RelPath)
-			rPath := RemotePath(profile.RemotePath, action.RelPath)
-
-			uploadErr := doUpload(client, localPath, rPath, action)
-
-			if uploadErr != nil {
-				// Try reconnect + retry once
-				fmt.Fprintf(os.Stderr, "  retry: %s\n", action.RelPath)
-				client.Close()
-				if reconnErr := client.Connect(); reconnErr == nil {
-					uploadErr = doUpload(client, localPath, rPath, action)
-				}
-			}
-
-			if uploadErr != nil {
-				result.Errors = append(result.Errors,
-					fmt.Sprintf("upload %s: %s", action.RelPath, translateError(uploadErr)))
-			} else {
-				result.Uploaded++
-			}
+			transferActions = append(transferActions, action)
 
 		case ActionDelete:
 			rPath := RemotePath(profile.RemotePath, action.RelPath)
@@ -451,10 +475,33 @@ func executeUp(client RemoteClient, profile *config.Profile, actions []MirrorEnt
 			fmt.Fprintf(os.Stderr, "  ! conflict (file vs directory), skipping: %s\n", action.RelPath)
 		}
 	}
+
+	jobs := make([]transferJob, len(transferActions))
+	for i, action := range transferActions {
+		action := action // capture per-iteration
+		localPath := filepath.Join(profile.Context, action.RelPath)
+		rPath := RemotePath(profile.RemotePath, action.RelPath)
+		jobs[i] = transferJob{
+			action: action,
+			run:    func() error { return doUpload(client, localPath, rPath, action) },
+		}
+	}
+
+	runTransfers(client, jobs, func(action MirrorEntry, err error) {
+		if err != nil {
+			result.Errors = append(result.Errors,
+				fmt.Sprintf("upload %s: %s", action.RelPath, translateError(err)))
+		} else {
+			result.Uploaded++
+		}
+	})
 }
 
-// executeDown applies mirror-down actions (remote → local)
+// executeDown applies mirror-down actions (remote → local). See executeUp
+// for the mkdir/transfer split rationale.
 func executeDown(client RemoteClient, profile *config.Profile, actions []MirrorEntry, result *MirrorResult) {
+	var transferActions []MirrorEntry
+
 	for _, action := range actions {
 		switch action.Action {
 		case ActionSkip:
@@ -471,26 +518,7 @@ func executeDown(client RemoteClient, profile *config.Profile, actions []MirrorE
 			}
 
 		case ActionDownload:
-			rPath := RemotePath(profile.RemotePath, action.RelPath)
-			localPath := filepath.Join(profile.Context, action.RelPath)
-
-			downloadErr := client.Download(rPath, localPath)
-
-			if downloadErr != nil {
-				// Try reconnect + retry once
-				fmt.Fprintf(os.Stderr, "  retry: %s\n", action.RelPath)
-				client.Close()
-				if reconnErr := client.Connect(); reconnErr == nil {
-					downloadErr = client.Download(rPath, localPath)
-				}
-			}
-
-			if downloadErr != nil {
-				result.Errors = append(result.Errors,
-					fmt.Sprintf("download %s: %s", action.RelPath, translateError(downloadErr)))
-			} else {
-				result.Downloaded++
-			}
+			transferActions = append(transferActions, action)
 
 		case ActionDelete:
 			localPath := filepath.Join(profile.Context, action.RelPath)
@@ -520,6 +548,136 @@ func executeDown(client RemoteClient, profile *config.Profile, actions []MirrorE
 			fmt.Fprintf(os.Stderr, "  ! conflict (file vs directory), skipping: %s\n", action.RelPath)
 		}
 	}
+
+	jobs := make([]transferJob, len(transferActions))
+	for i, action := range transferActions {
+		action := action // capture per-iteration
+		rPath := RemotePath(profile.RemotePath, action.RelPath)
+		localPath := filepath.Join(profile.Context, action.RelPath)
+		jobs[i] = transferJob{
+			action: action,
+			run:    func() error { return client.Download(rPath, localPath) },
+		}
+	}
+
+	runTransfers(client, jobs, func(action MirrorEntry, err error) {
+		if err != nil {
+			result.Errors = append(result.Errors,
+				fmt.Sprintf("download %s: %s", action.RelPath, translateError(err)))
+		} else {
+			result.Downloaded++
+		}
+	})
+}
+
+// transferJob is one queued upload or download.
+type transferJob struct {
+	action MirrorEntry
+	run    func() error
+}
+
+// reconnectCoordinator lets multiple goroutines sharing one RemoteClient
+// coordinate reconnect-on-failure without corrupting the shared connection.
+//
+// RemoteClient implementations (sftpClient in particular) hold their
+// underlying connection in plain, unsynchronized struct fields — Connect/
+// Close reassign those fields, which is only safe if no other goroutine is
+// concurrently using them. So a reconnect must never run while any other
+// worker still has a request in flight on the same client, and no worker
+// may start a new request while a reconnect is in progress.
+//
+// runGuarded takes rw for reading around each transfer attempt, so any
+// number of workers can transfer concurrently; reconnect takes rw for
+// writing, so it can only proceed once every in-flight transfer has
+// finished, and blocks new transfers from starting until it's done. gen is
+// layered on top purely to collapse duplicate reconnects: if several
+// workers fail at once (the same underlying connection died under all of
+// them), only the first to reach reconnect() actually closes+reconnects —
+// the rest see the generation has already moved on and just retry.
+type reconnectCoordinator struct {
+	rw  sync.RWMutex
+	gen int
+}
+
+// runGuarded runs fn (a single transfer attempt) holding a read lock, and
+// returns the generation observed at the time — pass that to reconnect if
+// fn fails.
+func (rc *reconnectCoordinator) runGuarded(fn func() error) (error, int) {
+	rc.rw.RLock()
+	defer rc.rw.RUnlock()
+	return fn(), rc.gen
+}
+
+// reconnect reconnects client, unless another worker already reconnected
+// since observedGen (in which case it's a no-op — the caller should just
+// retry). Blocks until every in-flight runGuarded call has returned.
+func (rc *reconnectCoordinator) reconnect(client RemoteClient, observedGen int) error {
+	rc.rw.Lock()
+	defer rc.rw.Unlock()
+	if rc.gen != observedGen {
+		return nil // another worker already reconnected since we failed
+	}
+	client.Close()
+	if err := client.Connect(); err != nil {
+		return err
+	}
+	rc.gen++
+	return nil
+}
+
+// runTransfers executes transfer jobs, in parallel (bounded by
+// MaxConcurrentTransfers) when the client supports concurrent requests —
+// SFTP only, since pkg/sftp's Client is documented safe for concurrent use
+// from multiple goroutines. FTP's single control connection allows only one
+// command in flight at a time, so it always runs with a single worker, which
+// reduces to the original one-at-a-time behavior. onResult runs under an
+// internal lock, so it's safe for it to mutate shared aggregate state (e.g.
+// a MirrorResult) directly without its own locking.
+func runTransfers(client RemoteClient, jobs []transferJob, onResult func(action MirrorEntry, err error)) {
+	if len(jobs) == 0 {
+		return
+	}
+
+	concurrent := supportsConcurrentRequests(client)
+	workers := 1
+	if concurrent {
+		workers = MaxConcurrentTransfers
+		if workers > len(jobs) {
+			workers = len(jobs)
+		}
+	}
+
+	var rc reconnectCoordinator
+	var resultMu sync.Mutex
+	jobsCh := make(chan transferJob)
+	var wg sync.WaitGroup
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobsCh {
+				err, gen := rc.runGuarded(job.run)
+				if err != nil {
+					// Try reconnect + retry once
+					fmt.Fprintf(os.Stderr, "  retry: %s\n", job.action.RelPath)
+					if rerr := rc.reconnect(client, gen); rerr == nil {
+						err, _ = rc.runGuarded(job.run)
+					}
+				}
+
+				resultMu.Lock()
+				onResult(job.action, err)
+				resultMu.Unlock()
+			}
+		}()
+	}
+
+	for _, j := range jobs {
+		jobsCh <- j
+	}
+	close(jobsCh)
+	wg.Wait()
 }
 
 // doUpload performs a single upload, choosing resume for large files

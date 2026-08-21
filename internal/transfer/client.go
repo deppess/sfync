@@ -88,6 +88,18 @@ const (
 	ReadDirTimeout   = 60 * time.Second // generous for large remote directories
 	AliveTimeout     = 5 * time.Second
 	ResumeThreshold  = 10 * 1024 * 1024 // 10 MB — files above this use resume
+
+	// MaxConcurrentReadDir bounds how many ReadDir calls walkRemote issues in
+	// parallel when the underlying client supports concurrent requests (SFTP
+	// only — see walkRemote in mirror.go).
+	MaxConcurrentReadDir = 8
+
+	// MaxConcurrentTransfers bounds how many file uploads/downloads run in
+	// parallel over one SFTP connection (see runTransfers in mirror.go).
+	// Kept smaller than MaxConcurrentReadDir since transfers are bandwidth-
+	// bound, not just latency-bound — over-parallelizing large files buys
+	// nothing and just contends for the same link.
+	MaxConcurrentTransfers = 4
 )
 
 // TransferTimeout calculates a timeout proportional to file size.
@@ -102,6 +114,24 @@ func TransferTimeout(fileSize int64) time.Duration {
 // Use this for all remote path construction. Never use filepath.Join for remote paths.
 func RemotePath(parts ...string) string {
 	return path.Join(parts...)
+}
+
+// concurrentClient is implemented by RemoteClient implementations whose
+// requests are safe to issue from multiple goroutines simultaneously.
+// pkg/sftp's Client documents this guarantee, so sftpClient implements it;
+// FTP's single control connection allows only one command in flight at a
+// time, so ftpClient does not. walkRemote and runTransfers (mirror.go) use
+// this to decide whether to parallelize directory listing / transfers.
+type concurrentClient interface {
+	SupportsConcurrentRequests() bool
+}
+
+// supportsConcurrentRequests reports whether client is safe to call from
+// multiple goroutines at once, defaulting to false for any client that
+// doesn't explicitly claim otherwise via concurrentClient.
+func supportsConcurrentRequests(client RemoteClient) bool {
+	cc, ok := client.(concurrentClient)
+	return ok && cc.SupportsConcurrentRequests()
 }
 
 // isSafeEntryName reports whether a directory-entry name returned by the

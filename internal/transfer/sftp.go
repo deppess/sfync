@@ -28,6 +28,10 @@ func newSFTPClient(profile *config.Profile) *sftpClient {
 	return &sftpClient{profile: profile}
 }
 
+// SupportsConcurrentRequests implements concurrentClient (see client.go) —
+// pkg/sftp's Client is documented safe to call from multiple goroutines.
+func (c *sftpClient) SupportsConcurrentRequests() bool { return true }
+
 // Connect establishes the SSH + SFTP connection
 func (c *sftpClient) Connect() error {
 	// Safety: close existing connection if any
