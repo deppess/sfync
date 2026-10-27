@@ -11,7 +11,7 @@ libnotify
 sshfs  rclone   # mounting only
 ```
 
-macOS:
+macOS (13 Ventura or later, Apple Silicon or Intel):
 
 ```
 rclone   # mounting only — sftp, ftp, and ftps profiles all mount via `rclone nfsmount`.
