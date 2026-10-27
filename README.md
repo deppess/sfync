@@ -99,6 +99,12 @@ Ignored directories are skipped by the file watcher. Changes to `.syncignore` ar
 
 Watches all profiles with `autoSync: true`. Debounces per-file, retries with exponential backoff, batches desktop notifications, and hot-reloads config on save.
 
+By default the daemon only uploads new and changed files. Set `"autoSyncDeletes": true` on a profile to also delete the remote copy when a file is deleted or renamed away locally. It's opt-in because every local deletion is mirrored, including files that vanish during a `git checkout` of another branch. Safeguards:
+
+- The check happens when the debounce fires, so an editor's delete-and-recreate save is still just an upload.
+- Nothing is deleted if the profile's `context` directory itself is missing (unmounted drive, moved project).
+- `.syncignore`d paths are never touched, and remote directories are removed only when already empty — never recursively.
+
 Linux: `install-daemon` creates a systemd user unit. Enable it with `systemctl --user enable sfync` to auto-start at login.
 
 ```bash

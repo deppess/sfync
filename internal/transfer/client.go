@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"net/textproto"
 	"os"
 	"path"
 	"strings"
 	"time"
+
+	"github.com/jlaffaye/ftp"
 
 	"github.com/deppess/sfync/internal/config"
 )
@@ -245,5 +249,29 @@ func wrapError(operation string, err error) error {
 	// Raw error goes to stderr for debugging
 	fmt.Fprintf(os.Stderr, "  debug: %s: %v\n", operation, err)
 	// Clean error returned to caller
-	return fmt.Errorf("%s: %s", operation, translateError(err))
+	return &cleanError{msg: fmt.Sprintf("%s: %s", operation, translateError(err)), err: err}
+}
+
+// cleanError carries the translated, user-facing message while keeping the
+// raw library error reachable via errors.Is/As — e.g. so callers can test
+// errors.Is(err, fs.ErrNotExist) instead of matching message text.
+type cleanError struct {
+	msg string
+	err error
+}
+
+func (e *cleanError) Error() string { return e.msg }
+func (e *cleanError) Unwrap() error { return e.err }
+
+// IsNotExist reports whether err from a RemoteClient means the remote path
+// doesn't exist. SFTP errors carry fs.ErrNotExist (pkg/sftp normalizes
+// SSH_FX_NO_SUCH_FILE). FTP only has reply code 550, which some servers
+// also use for permission errors — callers use this to decide *not* to act,
+// so erring toward "doesn't exist" is the safe direction.
+func IsNotExist(err error) bool {
+	if errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	var tpErr *textproto.Error
+	return errors.As(err, &tpErr) && tpErr.Code == ftp.StatusFileUnavailable
 }

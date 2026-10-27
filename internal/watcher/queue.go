@@ -23,7 +23,13 @@ type UploadQueue struct {
 	wg         sync.WaitGroup
 	profiles   map[string]*config.Profile
 	profilesMu sync.RWMutex
-	pool       *transfer.ConnectionPool
+	clients    clientSource
+}
+
+// clientSource hands out live connections per profile — satisfied by
+// *transfer.ConnectionPool, and by fakes in tests.
+type clientSource interface {
+	Get(profileName string) (transfer.RemoteClient, error)
 }
 
 type uploadTask struct {
@@ -32,12 +38,12 @@ type uploadTask struct {
 }
 
 // NewUploadQueue creates a new upload queue
-func NewUploadQueue(profiles map[string]*config.Profile, pool *transfer.ConnectionPool) *UploadQueue {
+func NewUploadQueue(profiles map[string]*config.Profile, pool clientSource) *UploadQueue {
 	return &UploadQueue{
 		queue:    make(chan *uploadTask, 100),
 		done:     make(chan struct{}),
 		profiles: profiles,
-		pool:     pool,
+		clients:  pool,
 	}
 }
 
@@ -142,20 +148,54 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 		// deleted moments later. That's not a failure — drop the task
 		// instead of retrying and raising an error notification. Checked on
 		// every attempt so a file deleted mid-retry is dropped too.
+		//
+		// With autoSyncDeletes on, a path that's gone is instead deleted
+		// remotely. The decision is made here, when the debounce fires, not
+		// when the event arrived: an editor's delete-then-recreate save
+		// collapses into one task that finds the file present and uploads it.
 		fi, statErr := os.Stat(absFile)
-		if errors.Is(statErr, fs.ErrNotExist) {
+		missing := errors.Is(statErr, fs.ErrNotExist)
+		if missing && !profile.AutoSyncDeletes {
 			fmt.Fprintf(os.Stderr, "Skipped: %s (no longer exists)\n", relPath)
 			return
 		}
-		if statErr == nil && !fi.Mode().IsRegular() {
+		if missing {
+			// Guard against mass deletion: if the context directory itself is
+			// gone (unmounted drive, moved or deleted project), every file in
+			// it looks deleted. That's never something to mirror.
+			if _, ctxErr := os.Stat(absContext); ctxErr != nil {
+				fmt.Fprintf(os.Stderr, "Not deleting %s: context %s is unavailable\n", relPath, absContext)
+				return
+			}
+		} else if statErr == nil && !fi.Mode().IsRegular() {
 			return
 		}
 
-		client, connErr := q.pool.Get(task.profileName)
+		client, connErr := q.clients.Get(task.profileName)
 		if connErr != nil {
 			lastErr = connErr
 			if attempt < maxRetries-1 {
 				fmt.Fprintf(os.Stderr, "Connection failed (attempt %d/%d): %s - %v\n", attempt+1, maxRetries, relPath, connErr)
+				select {
+				case <-time.After(delays[attempt]):
+				case <-q.done:
+					return
+				}
+			}
+			continue
+		}
+
+		if missing {
+			deleted, delErr := deleteRemote(client, remotePath, relPath)
+			if delErr == nil {
+				if deleted {
+					onSuccess(task.profileName, relPath+" (deleted)")
+				}
+				return
+			}
+			lastErr = delErr
+			if attempt < maxRetries-1 {
+				fmt.Fprintf(os.Stderr, "Delete failed (attempt %d/%d): %s - %v\n", attempt+1, maxRetries, relPath, delErr)
 				select {
 				case <-time.After(delays[attempt]):
 				case <-q.done:
@@ -205,6 +245,39 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 	}
 
 	onError(task.profileName, relPath, lastErr, maxRetries)
+}
+
+// deleteRemote removes the remote counterpart of a locally deleted path,
+// reporting whether anything was deleted. Already absent is not an error.
+// A directory is only removed if it's empty — never recursively — so remote
+// files that are .syncignore'd or were never synced are left alone; a
+// non-empty directory is kept with a log line rather than retried.
+func deleteRemote(client transfer.RemoteClient, remotePath, relPath string) (bool, error) {
+	info, err := client.Stat(remotePath)
+	if transfer.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	if info.IsDir {
+		if err := client.RemoveDir(remotePath); err != nil {
+			fmt.Fprintf(os.Stderr, "Kept remote directory %s/ (not empty or not removable: %v)\n", relPath, err)
+			return false, nil
+		}
+		fmt.Fprintf(os.Stderr, "Deleted remote directory: %s/\n", relPath)
+		return true, nil
+	}
+
+	if err := client.Remove(remotePath); err != nil {
+		if transfer.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	fmt.Fprintf(os.Stderr, "Deleted remote: %s\n", relPath)
+	return true, nil
 }
 
 // Stop shuts down the queue processor and waits for any in-flight upload to
