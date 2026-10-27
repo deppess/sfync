@@ -434,51 +434,24 @@ func sortActions(actions []MirrorEntry) []MirrorEntry {
 	return result
 }
 
-// executeUp applies mirror-up actions (local → remote). Mkdir/delete/rmdir/
-// conflict actions run inline as encountered; upload actions are collected
-// and handed to runTransfers so they can run in parallel when the client
-// supports it.
+// executeUp applies mirror-up actions (local → remote) in four phases:
+// mkdirs, uploads, file deletes, directory deletes. Each phase goes through
+// runTransfers, so it runs in parallel when the client supports it, with
+// ordering constraints kept where they matter: directories are created one
+// depth level at a time (parents strictly before children) and removed
+// deepest level first.
 func executeUp(client RemoteClient, profile *config.Profile, actions []MirrorEntry, result *MirrorResult) {
-	var transferActions []MirrorEntry
-
+	var mkdirs, uploads, deletes, deleteDirs []MirrorEntry
 	for _, action := range actions {
 		switch action.Action {
-		case ActionSkip:
-			continue
-
 		case ActionMkdir:
-			rPath := RemotePath(profile.RemotePath, action.RelPath)
-			if err := client.MkdirAll(rPath); err != nil {
-				result.Warnings = append(result.Warnings,
-					fmt.Sprintf("mkdir %s: %s", action.RelPath, translateError(err)))
-			} else {
-				result.Created++
-				fmt.Fprintf(os.Stderr, "  + mkdir: %s\n", action.RelPath)
-			}
-
+			mkdirs = append(mkdirs, action)
 		case ActionUpload:
-			transferActions = append(transferActions, action)
-
+			uploads = append(uploads, action)
 		case ActionDelete:
-			rPath := RemotePath(profile.RemotePath, action.RelPath)
-			if err := client.Remove(rPath); err != nil {
-				result.Warnings = append(result.Warnings,
-					fmt.Sprintf("delete %s: %s", action.RelPath, translateError(err)))
-			} else {
-				result.Deleted++
-				fmt.Fprintf(os.Stderr, "  - delete: %s\n", action.RelPath)
-			}
-
+			deletes = append(deletes, action)
 		case ActionDeleteDir:
-			rPath := RemotePath(profile.RemotePath, action.RelPath)
-			if err := client.RemoveDir(rPath); err != nil {
-				result.Warnings = append(result.Warnings,
-					fmt.Sprintf("rmdir %s: %s", action.RelPath, translateError(err)))
-			} else {
-				result.Deleted++
-				fmt.Fprintf(os.Stderr, "  - rmdir: %s/\n", action.RelPath)
-			}
-
+			deleteDirs = append(deleteDirs, action)
 		case ActionConflict:
 			result.Warnings = append(result.Warnings,
 				fmt.Sprintf("skipped %s: file on one side, directory on the other — resolve manually", action.RelPath))
@@ -486,25 +459,100 @@ func executeUp(client RemoteClient, profile *config.Profile, actions []MirrorEnt
 		}
 	}
 
-	jobs := make([]transferJob, len(transferActions))
-	for i, action := range transferActions {
-		action := action // capture per-iteration
-		localPath := filepath.Join(profile.Context, action.RelPath)
-		rPath := RemotePath(profile.RemotePath, action.RelPath)
-		jobs[i] = transferJob{
-			action: action,
-			run:    func() error { return doUpload(client, localPath, rPath, action) },
-		}
+	remote := func(a MirrorEntry) string { return RemotePath(profile.RemotePath, a.RelPath) }
+
+	// 1. Mkdir — mkdirs arrive sorted shallowest first (sortActions), and the
+	// remote root was ensured by MirrorUp, so each directory's parent exists
+	// by the time its level runs: a single Mkdir round trip suffices instead
+	// of MkdirAll's stat of every path component. MkdirAll remains the
+	// fallback (already exists, or a parent unexpectedly missing).
+	for _, level := range depthLevels(mkdirs) {
+		runTransfers(client, jobsFor(level, func(a MirrorEntry) error {
+			if err := client.Mkdir(remote(a)); err != nil {
+				return client.MkdirAll(remote(a))
+			}
+			return nil
+		}), func(a MirrorEntry, err error) {
+			if err != nil {
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("mkdir %s: %s", a.RelPath, translateError(err)))
+				return
+			}
+			result.Created++
+			fmt.Fprintf(os.Stderr, "  + mkdir: %s\n", a.RelPath)
+		})
 	}
 
-	runTransfers(client, jobs, func(action MirrorEntry, err error) {
+	// 2. Uploads
+	runTransfers(client, jobsFor(uploads, func(a MirrorEntry) error {
+		return doUpload(client, filepath.Join(profile.Context, a.RelPath), remote(a), a)
+	}), func(a MirrorEntry, err error) {
 		if err != nil {
 			result.Errors = append(result.Errors,
-				fmt.Sprintf("upload %s: %s", action.RelPath, translateError(err)))
+				fmt.Sprintf("upload %s: %s", a.RelPath, translateError(err)))
 		} else {
 			result.Uploaded++
 		}
 	})
+
+	// 3. File deletes — independent of each other, fully parallel. A file
+	// already gone (e.g. removed by the first try before a reconnect-retry)
+	// counts as deleted.
+	runTransfers(client, jobsFor(deletes, func(a MirrorEntry) error {
+		if err := client.Remove(remote(a)); err != nil && !IsNotExist(err) {
+			return err
+		}
+		return nil
+	}), func(a MirrorEntry, err error) {
+		if err != nil {
+			result.Warnings = append(result.Warnings,
+				fmt.Sprintf("delete %s: %s", a.RelPath, translateError(err)))
+			return
+		}
+		result.Deleted++
+		fmt.Fprintf(os.Stderr, "  - delete: %s\n", a.RelPath)
+	})
+
+	// 4. Directory deletes — deleteDirs arrive sorted deepest first, so each
+	// level's children are gone before their parents are attempted.
+	for _, level := range depthLevels(deleteDirs) {
+		runTransfers(client, jobsFor(level, func(a MirrorEntry) error {
+			return client.RemoveDir(remote(a))
+		}), func(a MirrorEntry, err error) {
+			if err != nil {
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("rmdir %s: %s", a.RelPath, translateError(err)))
+				return
+			}
+			result.Deleted++
+			fmt.Fprintf(os.Stderr, "  - rmdir: %s/\n", a.RelPath)
+		})
+	}
+}
+
+// depthLevels splits depth-sorted entries into runs of equal depth (number
+// of path separators), preserving order.
+func depthLevels(entries []MirrorEntry) [][]MirrorEntry {
+	var levels [][]MirrorEntry
+	for i := 0; i < len(entries); {
+		depth := strings.Count(entries[i].RelPath, "/")
+		j := i
+		for j < len(entries) && strings.Count(entries[j].RelPath, "/") == depth {
+			j++
+		}
+		levels = append(levels, entries[i:j])
+		i = j
+	}
+	return levels
+}
+
+// jobsFor wraps each entry in a transferJob running fn on it.
+func jobsFor(entries []MirrorEntry, fn func(MirrorEntry) error) []transferJob {
+	jobs := make([]transferJob, len(entries))
+	for i, a := range entries {
+		jobs[i] = transferJob{action: a, run: func() error { return fn(a) }}
+	}
+	return jobs
 }
 
 // executeDown applies mirror-down actions (remote → local). See executeUp
@@ -561,7 +609,6 @@ func executeDown(client RemoteClient, profile *config.Profile, actions []MirrorE
 
 	jobs := make([]transferJob, len(transferActions))
 	for i, action := range transferActions {
-		action := action // capture per-iteration
 		rPath := RemotePath(profile.RemotePath, action.RelPath)
 		localPath := filepath.Join(profile.Context, action.RelPath)
 		jobs[i] = transferJob{
@@ -618,6 +665,18 @@ func (rc *reconnectCoordinator) runGuarded(fn func() error) (error, int) {
 	return fn(), rc.gen
 }
 
+// healthy reports whether a failure observed at observedGen happened on a
+// connection that is still fine — i.e. no reconnect has happened since and
+// the connection still answers. Such a failure is a genuine per-file error
+// (permission denied, disk full) that a reconnect wouldn't fix; reconnecting
+// anyway would stall every other worker for nothing. Holds the read lock so
+// the liveness probe can't race a reconnect's Close/Connect.
+func (rc *reconnectCoordinator) healthy(client RemoteClient, observedGen int) bool {
+	rc.rw.RLock()
+	defer rc.rw.RUnlock()
+	return rc.gen == observedGen && client.IsAlive()
+}
+
 // reconnect reconnects client, unless another worker already reconnected
 // since observedGen (in which case it's a no-op — the caller should just
 // retry). Blocks until every in-flight runGuarded call has returned.
@@ -651,10 +710,7 @@ func runTransfers(client RemoteClient, jobs []transferJob, onResult func(action 
 	concurrent := supportsConcurrentRequests(client)
 	workers := 1
 	if concurrent {
-		workers = MaxConcurrentTransfers
-		if workers > len(jobs) {
-			workers = len(jobs)
-		}
+		workers = min(MaxConcurrentTransfers, len(jobs))
 	}
 
 	var rc reconnectCoordinator
@@ -663,13 +719,12 @@ func runTransfers(client RemoteClient, jobs []transferJob, onResult func(action 
 	var wg sync.WaitGroup
 
 	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for job := range jobsCh {
 				err, gen := rc.runGuarded(job.run)
-				if err != nil {
-					// Try reconnect + retry once
+				if err != nil && !rc.healthy(client, gen) {
+					// Connection died (or was already replaced by another
+					// worker): reconnect if still needed, then retry once
 					fmt.Fprintf(os.Stderr, "  retry: %s\n", job.action.RelPath)
 					if rerr := rc.reconnect(client, gen); rerr == nil {
 						err, _ = rc.runGuarded(job.run)
@@ -680,7 +735,7 @@ func runTransfers(client RemoteClient, jobs []transferJob, onResult func(action 
 				onResult(job.action, err)
 				resultMu.Unlock()
 			}
-		}()
+		})
 	}
 
 	for _, j := range jobs {

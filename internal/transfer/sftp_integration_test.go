@@ -228,10 +228,10 @@ func TestSFTPConcurrentDeadlinesDontInterfere(t *testing.T) {
 	// Many concurrent stats each register and release their own deadline;
 	// afterwards no deadline may linger on the shared connection.
 	done := make(chan error, 32)
-	for i := 0; i < 32; i++ {
+	for range 32 {
 		go func() { _, err := c.Stat(dir); done <- err }()
 	}
-	for i := 0; i < 32; i++ {
+	for range 32 {
 		if err := <-done; err != nil {
 			t.Fatalf("stat: %v", err)
 		}
@@ -264,5 +264,56 @@ func TestIsNotExistThroughWrappedErrors(t *testing.T) {
 	}
 	if ftp550.Error() != "stat: File or directory not found" {
 		t.Errorf("user-facing message changed: %q", ftp550.Error())
+	}
+}
+
+// Full mirror-up against a real (in-process) SFTP server: nested new
+// directories must be created parents-first across parallel levels, stale
+// remote files and nested stale directories must be removed deepest-first,
+// and a second run must find everything in sync.
+func TestSFTPMirrorUpEndToEnd(t *testing.T) {
+	c := connectTestClient(t, startSFTPServer(t))
+	local, remote := t.TempDir(), t.TempDir()
+
+	for _, f := range []string{"index.html", "a/b/c/deep.txt", "a/x.txt", "d/e.txt"} {
+		p := filepath.Join(local, f)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		os.WriteFile(p, []byte(f), 0o644)
+	}
+	for _, f := range []string{"stale.txt", "old/nested/gone.txt", "old/top.txt"} {
+		p := filepath.Join(remote, f)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		os.WriteFile(p, []byte("stale"), 0o644)
+	}
+
+	profile := &config.Profile{Context: local, RemotePath: remote}
+	res, err := MirrorUp(c, profile, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Success || len(res.Warnings) != 0 {
+		t.Fatalf("mirror not clean: errors=%v warnings=%v", res.Errors, res.Warnings)
+	}
+	if res.Uploaded != 4 || res.Created != 4 || res.Deleted != 5 {
+		t.Errorf("uploaded=%d created=%d deleted=%d, want 4/4/5 (dirs: a, a/b, a/b/c, d)", res.Uploaded, res.Created, res.Deleted)
+	}
+
+	for _, f := range []string{"index.html", "a/b/c/deep.txt", "a/x.txt", "d/e.txt"} {
+		if got, err := os.ReadFile(filepath.Join(remote, f)); err != nil || string(got) != f {
+			t.Errorf("remote %s = %q, %v", f, got, err)
+		}
+	}
+	for _, gone := range []string{"stale.txt", "old"} {
+		if _, err := os.Stat(filepath.Join(remote, gone)); !os.IsNotExist(err) {
+			t.Errorf("remote %s should be deleted", gone)
+		}
+	}
+
+	again, err := MirrorUp(c, profile, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again.Actions) != 0 {
+		t.Errorf("second run not in sync: %+v", again.Actions)
 	}
 }

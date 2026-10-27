@@ -67,9 +67,7 @@ func (q *UploadQueue) Enqueue(profileName, filePath string) {
 
 // Start starts processing the upload queue
 func (q *UploadQueue) Start(onSuccess func(profileName, filePath string), onError func(profileName, filePath string, err error, failCount int)) {
-	q.wg.Add(1)
-	go func() {
-		defer q.wg.Done()
+	q.wg.Go(func() {
 		for {
 			select {
 			case task := <-q.queue:
@@ -78,7 +76,7 @@ func (q *UploadQueue) Start(onSuccess func(profileName, filePath string), onErro
 				return
 			}
 		}
-	}()
+	})
 }
 
 // processUpload handles uploading a single file with retry logic
@@ -107,8 +105,8 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 
 	// Calculate relative path
 	var relPath string
-	if strings.HasPrefix(absFile, absContext+"/") {
-		relPath = strings.TrimPrefix(absFile, absContext+"/")
+	if after, ok := strings.CutPrefix(absFile, absContext+"/"); ok {
+		relPath = after
 	} else if absFile == absContext {
 		relPath = filepath.Base(absFile)
 	} else {
@@ -141,7 +139,7 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
 
 	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := range maxRetries {
 		// The file may be gone by the time its debounce fires: editors that
 		// save atomically (vim's 4913 probe, `file~` backups, JetBrains'
 		// ___jb_tmp___) create short-lived temp files that are renamed or

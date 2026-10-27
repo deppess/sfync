@@ -361,6 +361,16 @@ func (c *sftpClient) Download(remotePath, localPath string) error {
 	return nil
 }
 
+// Mkdir creates a single remote directory whose parent already exists.
+func (c *sftpClient) Mkdir(remotePath string) error {
+	defer c.deadlines.begin(OperationTimeout)()
+
+	if err := c.sftpClient.Mkdir(remotePath); err != nil {
+		return wrapError("mkdir", err)
+	}
+	return nil
+}
+
 // MkdirAll creates a remote directory and all parents
 func (c *sftpClient) MkdirAll(remotePath string) error {
 	// SFTP has no native MkdirAll — walk components.

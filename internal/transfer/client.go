@@ -71,6 +71,7 @@ type RemoteClient interface {
 	Upload(localPath, remotePath string) error
 	UploadResume(localPath, remotePath string) error
 	Download(remotePath, localPath string) error
+	Mkdir(remotePath string) error // single directory; parent must exist
 	MkdirAll(remotePath string) error
 	Remove(remotePath string) error
 	RemoveDir(remotePath string) error

@@ -270,6 +270,14 @@ func (c *ftpClient) Download(remotePath, localPath string) error {
 	return nil
 }
 
+// Mkdir creates a single remote directory whose parent already exists.
+func (c *ftpClient) Mkdir(remotePath string) error {
+	if err := c.conn.MakeDir(remotePath); err != nil {
+		return wrapError("mkdir", err)
+	}
+	return nil
+}
+
 // MkdirAll creates a remote directory and all parents
 func (c *ftpClient) MkdirAll(remotePath string) error {
 	components := strings.Split(remotePath, "/")

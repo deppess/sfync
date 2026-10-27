@@ -13,37 +13,43 @@ type fakeClient struct {
 	concurrent bool
 	downloadFn func(remotePath, localPath string) error
 
-	connectN    int32
-	closeN      int32
-	inFlight    int32
-	maxInFlight int32
+	connectN    atomic.Int32
+	closeN      atomic.Int32
+	dead        atomic.Int32 // 1 = connection dropped; Connect revives it
+	inFlight    atomic.Int32
+	maxInFlight atomic.Int32
 }
 
-func (f *fakeClient) Connect() error                                  { atomic.AddInt32(&f.connectN, 1); return nil }
-func (f *fakeClient) Close() error                                    { atomic.AddInt32(&f.closeN, 1); return nil }
-func (f *fakeClient) IsAlive() bool                                   { return true }
+func (f *fakeClient) Connect() error {
+	f.connectN.Add(1)
+	f.dead.Store(0)
+	return nil
+}
+func (f *fakeClient) Close() error                                    { f.closeN.Add(1); return nil }
+func (f *fakeClient) IsAlive() bool                                   { return f.dead.Load() == 0 }
 func (f *fakeClient) Stat(path string) (*RemoteFileInfo, error)       { return nil, nil }
 func (f *fakeClient) ReadDir(path string) ([]RemoteFileInfo, error)   { return nil, nil }
 func (f *fakeClient) Upload(localPath, remotePath string) error       { return nil }
 func (f *fakeClient) UploadResume(localPath, remotePath string) error { return nil }
 func (f *fakeClient) MkdirAll(remotePath string) error                { return nil }
+func (f *fakeClient) Mkdir(remotePath string) error                   { return nil }
 func (f *fakeClient) Remove(remotePath string) error                  { return nil }
 func (f *fakeClient) RemoveDir(remotePath string) error               { return nil }
 func (f *fakeClient) Chmod(remotePath string, mode os.FileMode) error { return nil }
 func (f *fakeClient) SupportsConcurrentRequests() bool                { return f.concurrent }
 
 func (f *fakeClient) Download(remotePath, localPath string) error {
-	n := atomic.AddInt32(&f.inFlight, 1)
+	n := f.inFlight.Add(1)
 	for {
-		max := atomic.LoadInt32(&f.maxInFlight)
+		max := f.maxInFlight.Load()
 		if n <= max {
 			break
 		}
-		if atomic.CompareAndSwapInt32(&f.maxInFlight, max, n) {
+		if f.maxInFlight.CompareAndSwap(max, n) {
 			break
 		}
 	}
-	defer atomic.AddInt32(&f.inFlight, -1)
+	defer f.inFlight.Add(-1)
 	if f.downloadFn != nil {
 		return f.downloadFn(remotePath, localPath)
 	}
@@ -76,7 +82,7 @@ func TestRunTransfers_SerialWhenNotConcurrent(t *testing.T) {
 		}
 	})
 
-	if max := atomic.LoadInt32(&client.maxInFlight); max != 1 {
+	if max := client.maxInFlight.Load(); max != 1 {
 		t.Errorf("maxInFlight = %d, want 1 (FTP-style client must stay serial)", max)
 	}
 }
@@ -109,16 +115,16 @@ func TestRunTransfers_ConcurrentWhenSupported(t *testing.T) {
 	// Wait until MaxConcurrentTransfers workers are simultaneously blocked
 	// inside downloadFn — proves that many ran concurrently, not just that
 	// the pool eventually processed every job.
-	for i := 0; i < MaxConcurrentTransfers; i++ {
+	for range MaxConcurrentTransfers {
 		<-arrived
 	}
 	close(release)
 	<-done
 
-	if max := atomic.LoadInt32(&client.maxInFlight); max < MaxConcurrentTransfers {
+	if max := client.maxInFlight.Load(); max < MaxConcurrentTransfers {
 		t.Errorf("maxInFlight = %d, want >= %d", max, MaxConcurrentTransfers)
 	}
-	if max := atomic.LoadInt32(&client.maxInFlight); max > MaxConcurrentTransfers {
+	if max := client.maxInFlight.Load(); max > MaxConcurrentTransfers {
 		t.Errorf("maxInFlight = %d, want <= %d (pool must stay bounded)", max, MaxConcurrentTransfers)
 	}
 }
@@ -132,16 +138,17 @@ func TestRunTransfers_SingleFlightReconnect(t *testing.T) {
 
 	client := &fakeClient{concurrent: true}
 
-	var attempted int32
+	var attempted atomic.Int32
 	failGate := make(chan struct{})
 
 	client.downloadFn = func(remotePath, localPath string) error {
-		n := atomic.AddInt32(&attempted, 1)
+		n := attempted.Add(1)
 		if n == int32(numJobs) {
 			close(failGate)
 		}
 		<-failGate // wait until every worker has made its first attempt
 		if n <= int32(numJobs) {
+			client.dead.Store(1)
 			return errors.New("connection lost")
 		}
 		return nil // retry (after reconnect) succeeds
@@ -159,10 +166,40 @@ func TestRunTransfers_SingleFlightReconnect(t *testing.T) {
 	if failures != 0 {
 		t.Errorf("failures = %d, want 0 (every job should succeed after the single reconnect)", failures)
 	}
-	if got := atomic.LoadInt32(&client.connectN); got != 1 {
+	if got := client.connectN.Load(); got != 1 {
 		t.Errorf("Connect() called %d times, want exactly 1", got)
 	}
-	if got := atomic.LoadInt32(&client.closeN); got != 1 {
+	if got := client.closeN.Load(); got != 1 {
 		t.Errorf("Close() called %d times, want exactly 1", got)
+	}
+}
+
+// A failure on a connection that is still alive (e.g. permission denied) is
+// a per-file error: it must be reported as-is, without reconnecting — a
+// reconnect waits out every in-flight worker, so doing it per failed file
+// would stall the whole pool for nothing.
+func TestRunTransfers_NoReconnectForErrorsOnLiveConnection(t *testing.T) {
+	client := &fakeClient{concurrent: true}
+	var attempts atomic.Int32
+	client.downloadFn = func(remotePath, localPath string) error {
+		attempts.Add(1)
+		return errors.New("permission denied")
+	}
+
+	var failures int32
+	runTransfers(client, makeDownloadJobs(client, 5), func(action MirrorEntry, err error) {
+		if err != nil {
+			atomic.AddInt32(&failures, 1)
+		}
+	})
+
+	if failures != 5 {
+		t.Errorf("failures = %d, want 5", failures)
+	}
+	if got := attempts.Load(); got != 5 {
+		t.Errorf("attempts = %d, want 5 (no retries on a live connection)", got)
+	}
+	if got := client.connectN.Load(); got != 0 {
+		t.Errorf("Connect() called %d times, want 0", got)
 	}
 }
