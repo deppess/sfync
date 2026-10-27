@@ -119,18 +119,20 @@ func Mount(profileName string, profile *config.Profile) error {
 		return fmt.Errorf("remote unreachable: %w", err)
 	}
 
+	if err := preflightHostKey(profile); err != nil {
+		return err
+	}
+
 	// Create mount point directory
 	if err = os.MkdirAll(mountPoint, 0755); err != nil {
 		return fmt.Errorf("failed to create mount point: %w", err)
 	}
 
-	// Mount based on protocol. macOS Homebrew's rclone has no FUSE support,
-	// so darwin always mounts via rclone nfsmount; Linux keeps sftp on
-	// sshfs, ftp on rclone FUSE.
-	if runtime.GOOS != "darwin" && profile.Protocol == "sftp" {
-		err = mountSSHFS(profile, mountPoint)
-	} else {
+	// Mount based on protocol (see UsesRclone)
+	if UsesRclone(profile) {
 		err = mountRclone(profile, mountPoint)
+	} else {
+		err = mountSSHFS(profile, mountPoint)
 	}
 
 	if err != nil {
