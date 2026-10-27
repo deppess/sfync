@@ -3,6 +3,7 @@ package transfer
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -22,6 +23,13 @@ import (
 // touches ~/.ssh/known_hosts.
 func startSFTPServer(t *testing.T) *config.Profile {
 	t.Helper()
+	return startSFTPServerWithKey(t, nil)
+}
+
+// startSFTPServerWithKey is startSFTPServer that also accepts public-key
+// auth for authorizedKey (when non-nil).
+func startSFTPServerWithKey(t *testing.T, authorizedKey ssh.PublicKey) *config.Profile {
+	t.Helper()
 
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -34,6 +42,12 @@ func startSFTPServer(t *testing.T) *config.Profile {
 	srvConfig := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
 			return nil, nil
+		},
+		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if authorizedKey != nil && samePublicKey(key, authorizedKey) {
+				return nil, nil
+			}
+			return nil, errors.New("unauthorized key")
 		},
 	}
 	srvConfig.AddHostKey(signer)

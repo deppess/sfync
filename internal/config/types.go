@@ -1,5 +1,11 @@
 package config
 
+import (
+	"os"
+	"path/filepath"
+	"strings"
+)
+
 // Profile represents a single server configuration
 type Profile struct {
 	Host             string `json:"host"`
@@ -73,4 +79,22 @@ func (p *Profile) SetDefaults() {
 	if p.AutoSyncDebounce == 0 {
 		p.AutoSyncDebounce = 2000 // 2 seconds default
 	}
+	p.SSHKey = ExpandHome(p.SSHKey)
+	p.Context = ExpandHome(p.Context)
+}
+
+// ExpandHome expands a leading "~" or "~/" to the current user's home
+// directory, the way a shell would. JSON config has no shell in between, so
+// without this "~/.ssh/id_ed25519" would be read as a literal relative path.
+// "~otheruser" forms are left alone. If the home directory can't be
+// determined the path is returned unchanged.
+func ExpandHome(p string) string {
+	if p != "~" && !strings.HasPrefix(p, "~/") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	return filepath.Join(home, p[1:])
 }

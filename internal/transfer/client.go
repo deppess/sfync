@@ -202,10 +202,10 @@ func translateError(err error) string {
 		return "Authentication failed"
 	}
 
-	// SSH key errors
-	if strings.Contains(msg, "passphrase") ||
-		strings.Contains(msg, "encrypted") {
-		return "SSH key is passphrase-protected — use an unencrypted key or ssh-agent"
+	// SSH key errors — sshKeySigners already produces actionable messages
+	// (including the exact ssh-add command), so pass them through as-is.
+	if strings.Contains(msg, "passphrase-protected") {
+		return msg
 	}
 
 	// Host key errors
