@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"github.com/deppess/sfync/internal/config"
@@ -108,19 +107,14 @@ func Mount(profileName string, openYazi bool) error {
 		return err
 	}
 
-	// Check protocol-specific dependencies. macOS Homebrew's rclone has no
-	// FUSE support, so mounting there always goes through rclone nfsmount
-	// regardless of protocol; Linux keeps sftp on sshfs, ftp on rclone FUSE.
-	if runtime.GOOS != "darwin" && profile.Protocol == "sftp" {
-		if err := deps.CheckRequired("sshfs"); err != nil {
-			notify.Error("Mount Error", err.Error())
-			return err
-		}
-	} else {
-		if err := deps.CheckRequired("rclone"); err != nil {
-			notify.Error("Mount Error", err.Error())
-			return err
-		}
+	// Check protocol-specific dependencies (see mount.UsesRclone)
+	mountTool := "sshfs"
+	if mount.UsesRclone(profile) {
+		mountTool = "rclone"
+	}
+	if err := deps.CheckRequired(mountTool); err != nil {
+		notify.Error("Mount Error", err.Error())
+		return err
 	}
 
 	// Check yazi and the detected terminal if needed

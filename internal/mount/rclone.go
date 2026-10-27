@@ -5,12 +5,16 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
+
+	"golang.org/x/crypto/ssh"
 
 	"github.com/deppess/sfync/internal/config"
 )
@@ -26,6 +30,12 @@ func buildRcloneRemoteConfig(profile *config.Profile) (string, error) {
 		var authLine string
 		if profile.SSHKey != "" {
 			authLine = fmt.Sprintf("key_file = %s\n", profile.SSHKey)
+			// Passphrase-protected key: have rclone take the matching key
+			// from ssh-agent (it selects it via key_file's .pub), the same
+			// way sync does in internal/transfer/sshauth.go.
+			if keyIsEncrypted(profile.SSHKey) {
+				authLine += "key_use_agent = true\n"
+			}
 		} else {
 			obscuredPass, err := obscurePassword(profile.Password)
 			if err != nil {
@@ -33,8 +43,21 @@ func buildRcloneRemoteConfig(profile *config.Profile) (string, error) {
 			}
 			authLine = fmt.Sprintf("pass = %s\n", obscuredPass)
 		}
-		return fmt.Sprintf("[sfync]\ntype = sftp\nhost = %s\nuser = %s\nport = %d\n%s",
-			profile.Host, profile.Username, profile.Port, authLine), nil
+		// rclone skips host key validation entirely unless given a
+		// known_hosts file. Point it at the same file sync uses, so
+		// verifyHostKey protects mounts too. (Mount pre-records unknown
+		// hosts via TOFU first — see preflightHostKey — since rclone itself
+		// rejects hosts not already in the file.)
+		var hostKeyLine string
+		if profile.VerifyHostKey == nil || *profile.VerifyHostKey {
+			knownHosts, err := knownHostsPath()
+			if err != nil {
+				return "", err
+			}
+			hostKeyLine = fmt.Sprintf("known_hosts_file = %s\n", knownHosts)
+		}
+		return fmt.Sprintf("[sfync]\ntype = sftp\nhost = %s\nuser = %s\nport = %d\n%s%s",
+			profile.Host, profile.Username, profile.Port, authLine, hostKeyLine), nil
 	}
 
 	obscuredPass, err := obscurePassword(profile.Password)
@@ -47,6 +70,29 @@ func buildRcloneRemoteConfig(profile *config.Profile) (string, error) {
 	}
 	return fmt.Sprintf("[sfync]\ntype = ftp\nhost = %s\nuser = %s\npass = %s\nport = %d\n%s",
 		profile.Host, profile.Username, obscuredPass, profile.Port, tlsLine), nil
+}
+
+// knownHostsPath is the OpenSSH known_hosts file, shared with sync's TOFU
+// verification (internal/transfer/hostkey.go).
+func knownHostsPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine home directory: %w", err)
+	}
+	return filepath.Join(home, ".ssh", "known_hosts"), nil
+}
+
+// keyIsEncrypted reports whether the private key at path is
+// passphrase-protected. Unreadable or unparseable keys report false and are
+// left for rclone to report.
+func keyIsEncrypted(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	_, err = ssh.ParsePrivateKey(data)
+	var missing *ssh.PassphraseMissingError
+	return errors.As(err, &missing)
 }
 
 // mountRclone mounts using rclone. On Linux this uses the FUSE-backed
