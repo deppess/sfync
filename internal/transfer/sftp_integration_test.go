@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"net"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -240,5 +241,28 @@ func TestSFTPConcurrentDeadlinesDontInterfere(t *testing.T) {
 	c.deadlines.mu.Unlock()
 	if inFlight != 0 {
 		t.Errorf("%d deadlines still registered after all ops finished", inFlight)
+	}
+}
+
+func TestIsNotExistThroughWrappedErrors(t *testing.T) {
+	c := connectTestClient(t, startSFTPServer(t))
+
+	_, err := c.Stat(filepath.Join(t.TempDir(), "missing"))
+	if err == nil || !IsNotExist(err) {
+		t.Errorf("SFTP stat of missing path: IsNotExist(%v) = false", err)
+	}
+	if _, err := c.Stat(t.TempDir()); err != nil {
+		t.Fatalf("stat existing: %v", err)
+	}
+
+	ftp550 := wrapError("stat", &textproto.Error{Code: 550, Msg: "No such file"})
+	if !IsNotExist(ftp550) {
+		t.Error("FTP 550 not recognized through wrapError")
+	}
+	if IsNotExist(wrapError("stat", &textproto.Error{Code: 530, Msg: "Not logged in"})) {
+		t.Error("FTP 530 misread as not-exist")
+	}
+	if ftp550.Error() != "stat: File or directory not found" {
+		t.Errorf("user-facing message changed: %q", ftp550.Error())
 	}
 }

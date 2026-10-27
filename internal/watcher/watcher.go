@@ -14,6 +14,7 @@ import (
 
 	"github.com/deppess/sfync/internal/config"
 	"github.com/deppess/sfync/internal/syncignore"
+	"github.com/deppess/sfync/internal/transfer"
 )
 
 // Watcher watches file changes for auto-sync
@@ -200,9 +201,21 @@ func (w *Watcher) Start() {
 					}
 				}
 
-				// Only process WRITE and CREATE events
-				if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
+				switch {
+				case event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create:
 					w.handleEvent(event)
+				case event.Op&fsnotify.Remove == fsnotify.Remove || event.Op&fsnotify.Rename == fsnotify.Rename:
+					// The path is gone (a rename reports the old name; the new
+					// name arrives as its own Create). Schedule it anyway: the
+					// queue re-checks when the debounce fires and either
+					// uploads (the file came back, e.g. an editor's atomic
+					// save) or, for profiles with autoSyncDeletes, deletes it
+					// remotely. Deciding there rather than here also means a
+					// config reload toggling autoSyncDeletes takes effect
+					// immediately.
+					if !transfer.IsPartialName(filepath.Base(event.Name)) {
+						w.schedule(event.Name)
+					}
 				}
 
 			case err, ok := <-w.fsWatcher.Errors:
@@ -258,6 +271,11 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 		return
 	}
 
+	w.schedule(filePath)
+}
+
+// schedule debounces a sync of filePath for every profile it belongs to.
+func (w *Watcher) schedule(filePath string) {
 	// Find which profile(s) this file belongs to
 	matchedProfiles := w.findMatchingProfiles(filePath)
 
@@ -267,6 +285,9 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	for _, profileName := range matchedProfiles {
 		profile := w.profiles[profileName]
 		callback := w.callbacks[profileName]
+		if profile == nil || callback == nil {
+			continue // unwatched by a config reload since findMatchingProfiles
+		}
 
 		// Get debounce delay (default 2000ms set in config.SetDefaults)
 		delay := time.Duration(profile.AutoSyncDebounce) * time.Millisecond

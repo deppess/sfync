@@ -18,7 +18,12 @@ type Profile struct {
 	Context          string `json:"context"`
 	AutoSync         bool   `json:"autoSync"`
 	AutoSyncDebounce int    `json:"autoSyncDebounce"` // milliseconds
-	VerifyHostKey    *bool  `json:"verifyHostKey"`    // nil = default true (TOFU)
+	// AutoSyncDeletes makes the daemon also delete the remote copy when a
+	// file is deleted or renamed away locally. Opt-in: with it on, any local
+	// deletion — including files vanishing during a `git checkout` — is
+	// mirrored to the server.
+	AutoSyncDeletes bool  `json:"autoSyncDeletes"`
+	VerifyHostKey   *bool `json:"verifyHostKey"` // nil = default true (TOFU)
 }
 
 // Config represents the entire configuration file
