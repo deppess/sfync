@@ -1,14 +1,15 @@
 package transfer
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -19,7 +20,8 @@ import (
 // sftpClient implements RemoteClient for SFTP connections
 type sftpClient struct {
 	profile    *config.Profile
-	conn       net.Conn // underlying TCP — used for SetDeadline
+	conn       net.Conn         // underlying TCP — its deadline is managed by deadlines
+	deadlines  *deadlineTracker // per-operation timeouts on the shared conn
 	sshClient  *ssh.Client
 	sftpClient *sftp.Client
 }
@@ -46,6 +48,14 @@ func (c *sftpClient) Connect() error {
 		return wrapError("connect", err)
 	}
 	c.conn = conn
+	c.deadlines = newDeadlineTracker(conn)
+
+	// ssh.ClientConfig.Timeout only bounds ssh.Dial's own TCP dial — it does
+	// not apply to a handshake over a conn we dialed ourselves — so bound the
+	// SSH handshake and SFTP subsystem negotiation explicitly. Without this a
+	// server that accepts TCP but never speaks would hang Connect forever.
+	endHandshake := c.deadlines.begin(DialTimeout)
+	defer endHandshake()
 
 	// 2. Build SSH config
 	sshConfig := &ssh.ClientConfig{
@@ -137,24 +147,14 @@ func (c *sftpClient) IsAlive() bool {
 	if c.sftpClient == nil {
 		return false
 	}
-	c.conn.SetDeadline(time.Now().Add(AliveTimeout))
+	defer c.deadlines.begin(AliveTimeout)()
 	_, err := c.sftpClient.Stat(".")
-	c.conn.SetDeadline(time.Time{})
 	return err == nil
-}
-
-func (c *sftpClient) setDeadline(d time.Duration) {
-	c.conn.SetDeadline(time.Now().Add(d))
-}
-
-func (c *sftpClient) clearDeadline() {
-	c.conn.SetDeadline(time.Time{})
 }
 
 // Stat returns info about a remote path
 func (c *sftpClient) Stat(remotePath string) (*RemoteFileInfo, error) {
-	c.setDeadline(OperationTimeout)
-	defer c.clearDeadline()
+	defer c.deadlines.begin(OperationTimeout)()
 
 	info, err := c.sftpClient.Stat(remotePath)
 	if err != nil {
@@ -165,8 +165,7 @@ func (c *sftpClient) Stat(remotePath string) (*RemoteFileInfo, error) {
 
 // ReadDir lists entries in a remote directory, skipping symlinks
 func (c *sftpClient) ReadDir(remotePath string) ([]RemoteFileInfo, error) {
-	c.setDeadline(ReadDirTimeout)
-	defer c.clearDeadline()
+	defer c.deadlines.begin(ReadDirTimeout)()
 
 	entries, err := c.sftpClient.ReadDir(remotePath)
 	if err != nil {
@@ -195,133 +194,135 @@ func (c *sftpClient) ReadDir(remotePath string) ([]RemoteFileInfo, error) {
 // (mirror.go pre-creates directories in a dedicated phase before any
 // transfers run; single-file callers like Push and the auto-sync queue call
 // MkdirAll explicitly before Upload/UploadResume).
+//
+// The upload is atomic: data goes to a hidden partial file beside
+// remotePath, which is renamed over remotePath only once complete — so the
+// live file is never left truncated by a failed transfer.
 func (c *sftpClient) Upload(localPath, remotePath string) error {
-	// Open and stat local file
+	return c.upload(localPath, remotePath, false)
+}
+
+// UploadResume is Upload for large files: a partial left behind by an
+// earlier failed attempt is continued instead of restarted (when it is still
+// valid — see canResumePartial), and a failed attempt keeps its partial for
+// the next try.
+func (c *sftpClient) UploadResume(localPath, remotePath string) error {
+	return c.upload(localPath, remotePath, true)
+}
+
+func (c *sftpClient) upload(localPath, remotePath string, resume bool) error {
+	op := "upload"
+	if resume {
+		op = "resume"
+	}
+
 	local, err := os.Open(localPath)
 	if err != nil {
-		return wrapError("upload", err)
+		return wrapError(op, err)
 	}
 	defer local.Close()
 
 	localInfo, err := local.Stat()
 	if err != nil {
-		return wrapError("upload", err)
+		return wrapError(op, err)
 	}
 
-	// Set deadline proportional to file size
-	c.setDeadline(TransferTimeout(localInfo.Size()))
-	defer c.clearDeadline()
+	partial := remotePartialPath(remotePath)
 
-	// Create remote file
-	remote, err := c.sftpClient.Create(remotePath)
-	if err != nil {
-		return wrapError("upload", err)
+	var offset int64
+	if resume {
+		endOp := c.deadlines.begin(OperationTimeout)
+		partialInfo, statErr := c.sftpClient.Stat(partial)
+		endOp()
+		if statErr == nil && canResumePartial(partialInfo.Size(), partialInfo.ModTime(), localInfo) {
+			offset = partialInfo.Size()
+		}
 	}
-	defer remote.Close()
 
-	// Stream copy
-	n, err := io.Copy(remote, local)
+	// Set deadline proportional to the bytes left to send
+	defer c.deadlines.begin(TransferTimeout(localInfo.Size() - offset))()
+
+	flags := os.O_WRONLY | os.O_CREATE
+	if offset == 0 {
+		flags |= os.O_TRUNC
+	}
+	remote, err := c.sftpClient.OpenFile(partial, flags)
 	if err != nil {
-		return wrapError("upload", err)
+		return wrapError(op, err)
+	}
+
+	if offset > 0 {
+		fmt.Fprintf(os.Stderr, "  resuming: %s (from %s, %s remaining)\n",
+			remotePath, HumanSize(offset), HumanSize(localInfo.Size()-offset))
+		if _, err = local.Seek(offset, io.SeekStart); err == nil {
+			_, err = remote.Seek(offset, io.SeekStart)
+		}
+	}
+
+	// Stream copy. Close errors matter here: with concurrent writes enabled,
+	// a write failure can surface only when the handle is closed.
+	var n int64
+	if err == nil {
+		n, err = io.Copy(remote, local)
+	}
+	if cerr := remote.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		if !resume {
+			c.removeQuiet(partial)
+		}
+		return wrapError(op, err)
 	}
 
 	// Preserve permissions (non-fatal)
-	if chmodErr := c.sftpClient.Chmod(remotePath, localInfo.Mode()); chmodErr != nil {
+	if chmodErr := c.sftpClient.Chmod(partial, localInfo.Mode()); chmodErr != nil {
 		fmt.Fprintf(os.Stderr, "  warning: chmod failed for %s: %v\n", remotePath, chmodErr)
 	}
 
 	// Preserve mtime so next diff sees files as in sync
-	if chtErr := c.sftpClient.Chtimes(remotePath, localInfo.ModTime(), localInfo.ModTime()); chtErr != nil {
+	if chtErr := c.sftpClient.Chtimes(partial, localInfo.ModTime(), localInfo.ModTime()); chtErr != nil {
 		fmt.Fprintf(os.Stderr, "  warning: chtimes failed for %s: %v\n", remotePath, chtErr)
 	}
 
-	fmt.Fprintf(os.Stderr, "  uploaded: %s (%s)\n", remotePath, HumanSize(n))
+	if err := c.replace(partial, remotePath); err != nil {
+		c.removeQuiet(partial)
+		return wrapError(op, err)
+	}
+
+	if offset > 0 {
+		fmt.Fprintf(os.Stderr, "  resumed: %s (+%s)\n", remotePath, HumanSize(n))
+	} else {
+		fmt.Fprintf(os.Stderr, "  uploaded: %s (%s)\n", remotePath, HumanSize(n))
+	}
 	return nil
 }
 
-// UploadResume uploads a file with resume support for large files
-func (c *sftpClient) UploadResume(localPath, remotePath string) error {
-	// Stat local file
-	localInfo, err := os.Stat(localPath)
-	if err != nil {
-		return wrapError("resume", err)
+// replace renames src over dst. OpenSSH's posix-rename extension does this
+// atomically. Plain SFTP v3 rename refuses to overwrite an existing target,
+// so without the extension dst is removed first — leaving only a brief
+// window where dst is missing, never one where it is truncated.
+func (c *sftpClient) replace(src, dst string) error {
+	if _, ok := c.sftpClient.HasExtension("posix-rename@openssh.com"); ok {
+		return c.sftpClient.PosixRename(src, dst)
 	}
-	localSize := localInfo.Size()
-
-	// Stat remote file
-	c.setDeadline(OperationTimeout)
-	remoteInfo, statErr := c.sftpClient.Stat(remotePath)
-	c.clearDeadline()
-
-	if statErr != nil {
-		// Remote doesn't exist — full upload
-		return c.Upload(localPath, remotePath)
-	}
-
-	remoteSize := remoteInfo.Size()
-
-	// Decide action
-	if remoteSize == localSize {
-		fmt.Fprintf(os.Stderr, "  skipped (already complete): %s\n", remotePath)
+	if err := c.sftpClient.Rename(src, dst); err == nil {
 		return nil
 	}
-	if remoteSize > localSize {
-		// Remote is larger — corrupt or different file, full re-upload
-		fmt.Fprintf(os.Stderr, "  re-uploading (remote larger than local): %s\n", remotePath)
-		return c.Upload(localPath, remotePath)
+	if err := c.sftpClient.Remove(dst); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
 	}
-
-	// Resume: remote is smaller than local
-	fmt.Fprintf(os.Stderr, "  resuming: %s (from %s, %s remaining)\n",
-		remotePath, HumanSize(remoteSize), HumanSize(localSize-remoteSize))
-
-	c.setDeadline(TransferTimeout(localSize - remoteSize))
-	defer c.clearDeadline()
-
-	// Open local, seek past already-uploaded portion
-	local, err := os.Open(localPath)
-	if err != nil {
-		return wrapError("resume", err)
-	}
-	defer local.Close()
-
-	if _, err := local.Seek(remoteSize, io.SeekStart); err != nil {
-		return wrapError("resume", err)
-	}
-
-	// Open remote for writing and seek to end
-	remote, err := c.sftpClient.OpenFile(remotePath, os.O_WRONLY)
-	if err != nil {
-		// Can't open for append — fall back to full upload
-		fmt.Fprintf(os.Stderr, "  warning: open for append failed, doing full upload\n")
-		return c.Upload(localPath, remotePath)
-	}
-	defer remote.Close()
-
-	if _, err := remote.Seek(0, io.SeekEnd); err != nil {
-		fmt.Fprintf(os.Stderr, "  warning: seek failed, doing full upload\n")
-		return c.Upload(localPath, remotePath)
-	}
-
-	// Stream remaining bytes
-	n, err := io.Copy(remote, local)
-	if err != nil {
-		return wrapError("resume", err)
-	}
-
-	// Preserve permissions and mtime (same as Upload, to keep diff clean)
-	if chmodErr := c.sftpClient.Chmod(remotePath, localInfo.Mode()); chmodErr != nil {
-		fmt.Fprintf(os.Stderr, "  warning: chmod failed for %s: %v\n", remotePath, chmodErr)
-	}
-	if chtErr := c.sftpClient.Chtimes(remotePath, localInfo.ModTime(), localInfo.ModTime()); chtErr != nil {
-		fmt.Fprintf(os.Stderr, "  warning: chtimes failed for %s: %v\n", remotePath, chtErr)
-	}
-
-	fmt.Fprintf(os.Stderr, "  resumed: %s (+%s)\n", remotePath, HumanSize(n))
-	return nil
+	return c.sftpClient.Rename(src, dst)
 }
 
-// Download retrieves a remote file to a local path
+// removeQuiet best-effort deletes a remote file (used to clean up partials).
+func (c *sftpClient) removeQuiet(remotePath string) {
+	defer c.deadlines.begin(OperationTimeout)()
+	c.sftpClient.Remove(remotePath)
+}
+
+// Download retrieves a remote file to a local path. The local file is only
+// replaced once the download has fully succeeded (see writeLocalAtomic).
 func (c *sftpClient) Download(remotePath, localPath string) error {
 	// Ensure local directory exists
 	localDir := filepath.Dir(localPath)
@@ -330,15 +331,14 @@ func (c *sftpClient) Download(remotePath, localPath string) error {
 	}
 
 	// Stat remote for size and deadline
-	c.setDeadline(OperationTimeout)
+	endOp := c.deadlines.begin(OperationTimeout)
 	remoteInfo, err := c.sftpClient.Stat(remotePath)
-	c.clearDeadline()
+	endOp()
 	if err != nil {
 		return wrapError("download", err)
 	}
 
-	c.setDeadline(TransferTimeout(remoteInfo.Size()))
-	defer c.clearDeadline()
+	defer c.deadlines.begin(TransferTimeout(remoteInfo.Size()))()
 
 	// Open remote
 	remote, err := c.sftpClient.Open(remotePath)
@@ -347,32 +347,10 @@ func (c *sftpClient) Download(remotePath, localPath string) error {
 	}
 	defer remote.Close()
 
-	// If a symlink already exists at this path, remove it first — os.Create
-	// would otherwise follow it and write through to wherever it points. A
-	// local attacker with write access to the sync directory could plant
-	// such a symlink to redirect a download to an arbitrary location.
-	if fi, lerr := os.Lstat(localPath); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
-		os.Remove(localPath)
-	}
-
-	// Create local (truncate if exists)
-	local, err := os.Create(localPath)
+	// Stream to a temp file and rename into place, preserving remote mtime
+	n, err := writeLocalAtomic(localPath, remote, nil, remoteInfo.ModTime())
 	if err != nil {
 		return wrapError("download", err)
-	}
-
-	// Stream
-	n, err := io.Copy(local, remote)
-	local.Close()
-	if err != nil {
-		// Clean up partial local file on failure
-		os.Remove(localPath)
-		return wrapError("download", err)
-	}
-
-	// Preserve remote mtime on local file
-	if err := os.Chtimes(localPath, remoteInfo.ModTime(), remoteInfo.ModTime()); err != nil {
-		fmt.Fprintf(os.Stderr, "  warning: chtimes failed for %s: %v\n", localPath, err)
 	}
 
 	fmt.Fprintf(os.Stderr, "  downloaded: %s (%s)\n", localPath, HumanSize(n))
@@ -399,22 +377,22 @@ func (c *sftpClient) MkdirAll(remotePath string) error {
 		}
 
 		// Check if exists
-		c.setDeadline(OperationTimeout)
+		endOp := c.deadlines.begin(OperationTimeout)
 		_, statErr := c.sftpClient.Stat(current)
-		c.clearDeadline()
+		endOp()
 		if statErr == nil {
 			continue
 		}
 
 		// Try to create
-		c.setDeadline(OperationTimeout)
+		endOp = c.deadlines.begin(OperationTimeout)
 		mkErr := c.sftpClient.Mkdir(current)
-		c.clearDeadline()
+		endOp()
 		if mkErr != nil {
 			// Race: check if created between Stat and Mkdir
-			c.setDeadline(OperationTimeout)
+			endOp := c.deadlines.begin(OperationTimeout)
 			_, raceStatErr := c.sftpClient.Stat(current)
-			c.clearDeadline()
+			endOp()
 			if raceStatErr == nil {
 				continue
 			}
@@ -426,8 +404,7 @@ func (c *sftpClient) MkdirAll(remotePath string) error {
 
 // Remove deletes a remote file
 func (c *sftpClient) Remove(remotePath string) error {
-	c.setDeadline(OperationTimeout)
-	defer c.clearDeadline()
+	defer c.deadlines.begin(OperationTimeout)()
 
 	if err := c.sftpClient.Remove(remotePath); err != nil {
 		return wrapError("remove", err)
@@ -437,8 +414,7 @@ func (c *sftpClient) Remove(remotePath string) error {
 
 // RemoveDir deletes an empty remote directory
 func (c *sftpClient) RemoveDir(remotePath string) error {
-	c.setDeadline(OperationTimeout)
-	defer c.clearDeadline()
+	defer c.deadlines.begin(OperationTimeout)()
 
 	if err := c.sftpClient.RemoveDirectory(remotePath); err != nil {
 		return wrapError("rmdir", err)
@@ -448,8 +424,7 @@ func (c *sftpClient) RemoveDir(remotePath string) error {
 
 // Chmod sets permissions on a remote file
 func (c *sftpClient) Chmod(remotePath string, mode os.FileMode) error {
-	c.setDeadline(OperationTimeout)
-	defer c.clearDeadline()
+	defer c.deadlines.begin(OperationTimeout)()
 
 	if err := c.sftpClient.Chmod(remotePath, mode); err != nil {
 		return wrapError("chmod", err)

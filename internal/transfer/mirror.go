@@ -154,6 +154,11 @@ func walkLocal(localRoot string, patterns []string) (map[string]localEntry, erro
 			return nil
 		}
 
+		// Skip sfync's own in-progress transfer files (see partialSuffix)
+		if !d.IsDir() && IsPartialName(d.Name()) {
+			return nil
+		}
+
 		// Get relative path
 		relPath, relErr := filepath.Rel(localRoot, p)
 		if relErr != nil || relPath == "." {
@@ -223,6 +228,11 @@ func walkRemote(client RemoteClient, remoteRoot string, patterns []string) (map[
 		var subdirs []subdir
 		mu.Lock()
 		for _, item := range items {
+			// Skip sfync's own in-progress transfer files (see partialSuffix)
+			if !item.IsDir && IsPartialName(item.Name) {
+				continue
+			}
+
 			relPath := item.Name
 			if relDir != "" {
 				relPath = relDir + "/" + item.Name

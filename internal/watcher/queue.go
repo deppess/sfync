@@ -1,7 +1,9 @@
 package watcher
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -108,6 +110,12 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 		return
 	}
 
+	// Never sync sfync's own in-progress transfer files — e.g. the temp
+	// files a concurrent `sfync down` writes into this context.
+	if transfer.IsPartialName(filepath.Base(absFile)) {
+		return
+	}
+
 	// Check .syncignore
 	patterns, err := syncignore.Load(absContext)
 	if err != nil {
@@ -128,6 +136,21 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		// The file may be gone by the time its debounce fires: editors that
+		// save atomically (vim's 4913 probe, `file~` backups, JetBrains'
+		// ___jb_tmp___) create short-lived temp files that are renamed or
+		// deleted moments later. That's not a failure — drop the task
+		// instead of retrying and raising an error notification. Checked on
+		// every attempt so a file deleted mid-retry is dropped too.
+		fi, statErr := os.Stat(absFile)
+		if errors.Is(statErr, fs.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "Skipped: %s (no longer exists)\n", relPath)
+			return
+		}
+		if statErr == nil && !fi.Mode().IsRegular() {
+			return
+		}
+
 		client, connErr := q.pool.Get(task.profileName)
 		if connErr != nil {
 			lastErr = connErr
@@ -159,7 +182,7 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 
 		// Use resume for large files (mirrors mirror.go behaviour)
 		var uploadErr error
-		if fi, statErr := os.Stat(absFile); statErr == nil && fi.Size() >= transfer.ResumeThreshold {
+		if statErr == nil && fi.Size() >= transfer.ResumeThreshold {
 			uploadErr = client.UploadResume(absFile, remotePath)
 		} else {
 			uploadErr = client.Upload(absFile, remotePath)
