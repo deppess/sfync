@@ -65,13 +65,17 @@ func (c *sftpClient) Connect() error {
 
 	// Authentication method
 	if c.profile.SSHKey != "" {
-		authMethod, err := sshKeyAuth(c.profile.SSHKey)
+		// The agent connection is only used for signing during the
+		// handshake below, so it can be closed when Connect returns.
+		ag, closeAgent := dialAgent()
+		defer closeAgent()
+		signers, err := sshKeySigners(c.profile.SSHKey, ag)
 		if err != nil {
 			c.conn.Close()
 			c.conn = nil
 			return wrapError("connect", err)
 		}
-		sshConfig.Auth = []ssh.AuthMethod{authMethod}
+		sshConfig.Auth = []ssh.AuthMethod{ssh.PublicKeys(signers...)}
 	} else {
 		sshConfig.Auth = []ssh.AuthMethod{ssh.Password(c.profile.Password)}
 	}
@@ -430,24 +434,6 @@ func (c *sftpClient) Chmod(remotePath string, mode os.FileMode) error {
 		return wrapError("chmod", err)
 	}
 	return nil
-}
-
-// sshKeyAuth reads an SSH private key and returns an auth method
-func sshKeyAuth(keyPath string) (ssh.AuthMethod, error) {
-	keyBytes, err := os.ReadFile(keyPath)
-	if err != nil {
-		return nil, fmt.Errorf("SSH key not found: %s", keyPath)
-	}
-
-	key, err := ssh.ParsePrivateKey(keyBytes)
-	if err != nil {
-		if _, ok := err.(*ssh.PassphraseMissingError); ok {
-			return nil, fmt.Errorf("SSH key is passphrase-protected: %s", keyPath)
-		}
-		return nil, fmt.Errorf("cannot parse SSH key %s: %w", keyPath, err)
-	}
-
-	return ssh.PublicKeys(key), nil
 }
 
 // fileInfoToRemote converts an os.FileInfo to a RemoteFileInfo

@@ -50,7 +50,7 @@ cp sfync /opt/homebrew/bin/sfync      # macOS on Apple Silicon
 }
 ```
 
-`protocol` is `sftp` (default), `ftp`, or `ftps` (explicit AUTH TLS — same plaintext-`password` requirement as `ftp`, but the connection is encrypted; prefer this over `ftp` whenever the server supports it). `password` or `sshKey` required for SFTP. FTP/FTPS require `password`. Passwords are stored in plaintext — `chmod 600 ~/.config/sfync/config.json`.
+`protocol` is `sftp` (default), `ftp`, or `ftps` (explicit AUTH TLS — same plaintext-`password` requirement as `ftp`, but the connection is encrypted; prefer this over `ftp` whenever the server supports it). `password` or `sshKey` required for SFTP. `sshKey` and `context` may start with `~/`. A passphrase-protected `sshKey` is used through ssh-agent: load it once with `ssh-add --apple-use-keychain <key>` on macOS (persists across logins, including for the daemon) or `ssh-add <key>` on Linux. Mounts use the same key handling and host key verification as sync. FTP/FTPS require `password`. Passwords are stored in plaintext — `chmod 600 ~/.config/sfync/config.json`.
 
 ## Commands
 

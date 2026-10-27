@@ -124,3 +124,37 @@ func TestValidate(t *testing.T) {
 		})
 	}
 }
+
+func TestExpandHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	tests := map[string]string{
+		"~":                  home,
+		"~/.ssh/id_ed25519":  home + "/.ssh/id_ed25519",
+		"/abs/path":          "/abs/path",
+		"relative/path":      "relative/path",
+		"~otheruser/key":     "~otheruser/key",
+		"":                   "",
+		"/path/with/~/tilde": "/path/with/~/tilde",
+	}
+	for in, want := range tests {
+		if got := ExpandHome(in); got != want {
+			t.Errorf("ExpandHome(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSetDefaultsExpandsHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	p := Profile{SSHKey: "~/.ssh/id_ed25519", Context: "~/projects/site"}
+	p.SetDefaults()
+	if p.SSHKey != home+"/.ssh/id_ed25519" {
+		t.Errorf("SSHKey = %q", p.SSHKey)
+	}
+	if p.Context != home+"/projects/site" {
+		t.Errorf("Context = %q", p.Context)
+	}
+}
