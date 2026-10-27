@@ -13,8 +13,26 @@ BIN="$APP/Contents/MacOS/sfync-notifier"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-echo "Compiling main.swift..."
-swiftc -O -whole-module-optimization main.swift -o "$BIN"
+# Deployment target: matches the Go toolchain's macOS floor (Go 1.27
+# requires macOS 13) and LSMinimumSystemVersion in Info.plist. Without an
+# explicit -target, swiftc targets the build machine's own macOS version and
+# the helper silently fails to launch on anything older.
+MIN_MACOS=13.0
+
+# Universal binary: Apple Silicon and Intel. The arm64 slice must stay
+# native — Apple is removing general Rosetta support starting with macOS 28
+# and flags bundled helper components that lack it
+# (https://support.apple.com/en-us/102527). The x86_64 slice is for Intel
+# Macs only; it can be smoke-tested on Apple silicon with
+# `arch -x86_64 <binary>` only while Rosetta is still available.
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+for ARCH in arm64 x86_64; do
+  echo "Compiling main.swift ($ARCH, macOS $MIN_MACOS+)..."
+  swiftc -O -whole-module-optimization -target "$ARCH-apple-macos$MIN_MACOS" \
+    main.swift -o "$WORK/sfync-notifier-$ARCH"
+done
+lipo -create "$WORK/sfync-notifier-arm64" "$WORK/sfync-notifier-x86_64" -output "$BIN"
 chmod 755 "$BIN"
 
 cp Info.plist "$APP/Contents/Info.plist"
