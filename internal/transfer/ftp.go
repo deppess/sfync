@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jlaffaye/ftp"
@@ -122,76 +123,122 @@ func (c *ftpClient) ReadDir(remotePath string) ([]RemoteFileInfo, error) {
 // (mirror.go pre-creates directories in a dedicated phase before any
 // transfers run; single-file callers like Push and the auto-sync queue call
 // MkdirAll explicitly before Upload/UploadResume).
+//
+// Like sftpClient.Upload, the upload goes to a hidden partial file that is
+// renamed over remotePath only once complete.
 func (c *ftpClient) Upload(localPath, remotePath string) error {
+	return c.upload(localPath, remotePath, false)
+}
+
+// UploadResume is Upload for large files: a still-valid partial from an
+// earlier failed attempt is continued (REST + STOR) instead of restarted,
+// and a failed attempt keeps its partial for the next try.
+func (c *ftpClient) UploadResume(localPath, remotePath string) error {
+	return c.upload(localPath, remotePath, true)
+}
+
+func (c *ftpClient) upload(localPath, remotePath string, resume bool) error {
+	op := "upload"
+	if resume {
+		op = "resume"
+	}
+
 	local, err := os.Open(localPath)
 	if err != nil {
-		return wrapError("upload", err)
+		return wrapError(op, err)
 	}
 	defer local.Close()
 
 	localInfo, err := local.Stat()
 	if err != nil {
-		return wrapError("upload", err)
+		return wrapError(op, err)
 	}
 
-	// FTP Stor
-	if err := c.conn.Stor(remotePath, local); err != nil {
-		return wrapError("upload", err)
+	partial := remotePartialPath(remotePath)
+
+	var offset int64
+	if resume {
+		size, sizeErr := c.conn.FileSize(partial)
+		if sizeErr == nil {
+			// No MDTM support means we can't tell whether the partial is
+			// from the current version of the file — restart to be safe.
+			if mtime, timeErr := c.conn.GetTime(partial); timeErr == nil &&
+				canResumePartial(size, mtime, localInfo) {
+				offset = size
+			}
+		}
+	}
+
+	if offset > 0 {
+		fmt.Fprintf(os.Stderr, "  resuming: %s (from %s, %s remaining)\n",
+			remotePath, HumanSize(offset), HumanSize(localInfo.Size()-offset))
+		if _, err = local.Seek(offset, io.SeekStart); err == nil {
+			err = c.conn.StorFrom(partial, local, uint64(offset))
+		}
+		if err != nil {
+			// REST unsupported or the partial is unusable — restart from zero
+			fmt.Fprintf(os.Stderr, "  warning: resume failed (%s), doing full upload\n", translateError(err))
+			offset = 0
+		}
+	}
+	if offset == 0 {
+		if _, err = local.Seek(0, io.SeekStart); err == nil {
+			err = c.conn.Stor(partial, local)
+		}
+	}
+	if err != nil {
+		if !resume {
+			c.conn.Delete(partial)
+		}
+		return wrapError(op, err)
+	}
+
+	// Preserve mtime (MFMT, or vsftpd's writable MDTM) so the next diff sees
+	// the file as in sync. Without it the remote mtime is the upload time and
+	// every subsequent `sfync up` would re-upload every file. Rename keeps
+	// the mtime, so set it on the partial before swapping it in.
+	if c.conn.IsSetTimeSupported() {
+		if err := c.conn.SetTime(partial, localInfo.ModTime()); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: set mtime failed for %s: %v\n", remotePath, err)
+		}
+	} else {
+		warnNoSetTime(c.profile.Host)
+	}
+
+	if err := c.replace(partial, remotePath); err != nil {
+		c.conn.Delete(partial)
+		return wrapError(op, err)
 	}
 
 	fmt.Fprintf(os.Stderr, "  uploaded: %s (%s)\n", remotePath, HumanSize(localInfo.Size()))
 	return nil
 }
 
-// UploadResume uploads a file with resume support
-func (c *ftpClient) UploadResume(localPath, remotePath string) error {
-	localInfo, err := os.Stat(localPath)
-	if err != nil {
-		return wrapError("resume", err)
-	}
-	localSize := localInfo.Size()
-
-	// Get remote size
-	remoteSize, err := c.conn.FileSize(remotePath)
-	if err != nil {
-		// File doesn't exist remotely — full upload
-		return c.Upload(localPath, remotePath)
-	}
-
-	if remoteSize == localSize {
-		fmt.Fprintf(os.Stderr, "  skipped (already complete): %s\n", remotePath)
+// replace renames src over dst. Most Unix FTP servers overwrite on RNTO;
+// servers that refuse (e.g. IIS) get dst deleted first, leaving only a brief
+// window where dst is missing, never one where it is truncated.
+func (c *ftpClient) replace(src, dst string) error {
+	if err := c.conn.Rename(src, dst); err == nil {
 		return nil
 	}
-	if remoteSize > localSize {
-		fmt.Fprintf(os.Stderr, "  re-uploading (remote larger than local): %s\n", remotePath)
-		return c.Upload(localPath, remotePath)
-	}
-
-	// Resume: remote is smaller
-	fmt.Fprintf(os.Stderr, "  resuming: %s (from %s, %s remaining)\n",
-		remotePath, HumanSize(remoteSize), HumanSize(localSize-remoteSize))
-
-	local, err := os.Open(localPath)
-	if err != nil {
-		return wrapError("resume", err)
-	}
-	defer local.Close()
-
-	if _, err := local.Seek(remoteSize, io.SeekStart); err != nil {
-		return wrapError("resume", err)
-	}
-
-	if err := c.conn.StorFrom(remotePath, local, uint64(remoteSize)); err != nil {
-		// StorFrom not supported — full upload
-		fmt.Fprintf(os.Stderr, "  warning: resume not supported by server, doing full upload\n")
-		return c.Upload(localPath, remotePath)
-	}
-
-	fmt.Fprintf(os.Stderr, "  resumed: %s (+%s)\n", remotePath, HumanSize(localSize-remoteSize))
-	return nil
+	c.conn.Delete(dst) // may fail if dst doesn't exist — the retry decides
+	return c.conn.Rename(src, dst)
 }
 
-// Download retrieves a remote file to a local path
+// noSetTimeWarned records hosts already warned about missing MFMT support,
+// so a mirror of many files warns once rather than per file.
+var noSetTimeWarned sync.Map
+
+func warnNoSetTime(host string) {
+	if _, already := noSetTimeWarned.LoadOrStore(host, true); !already {
+		fmt.Fprintf(os.Stderr,
+			"  warning: %s does not support setting file times (MFMT) — "+
+				"uploaded files will look changed to the next sync\n", host)
+	}
+}
+
+// Download retrieves a remote file to a local path. The local file is only
+// replaced once the download has fully succeeded (see writeLocalAtomic).
 func (c *ftpClient) Download(remotePath, localPath string) error {
 	// Ensure local directory exists
 	localDir := filepath.Dir(localPath)
@@ -200,42 +247,23 @@ func (c *ftpClient) Download(remotePath, localPath string) error {
 	}
 
 	// Stat remote for mtime
-	entry, statErr := c.conn.GetEntry(remotePath)
+	var mtime time.Time
+	if entry, statErr := c.conn.GetEntry(remotePath); statErr == nil {
+		mtime = entry.Time
+	}
 
 	// FTP Retr
 	resp, err := c.conn.Retr(remotePath)
 	if err != nil {
 		return wrapError("download", err)
 	}
-	defer resp.Close()
+	defer resp.Close() // idempotent; writeLocalAtomic closes it first
 
-	// If a symlink already exists at this path, remove it first — os.Create
-	// would otherwise follow it and write through to wherever it points. A
-	// local attacker with write access to the sync directory could plant
-	// such a symlink to redirect a download to an arbitrary location.
-	if fi, lerr := os.Lstat(localPath); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
-		os.Remove(localPath)
-	}
-
-	// Create local file
-	local, err := os.Create(localPath)
+	// resp.Close is passed as finish: it reads the server's end-of-transfer
+	// status, so a transfer the server aborted is never committed as complete.
+	n, err := writeLocalAtomic(localPath, resp, resp.Close, mtime)
 	if err != nil {
 		return wrapError("download", err)
-	}
-
-	n, err := io.Copy(local, resp)
-	local.Close()
-	if err != nil {
-		// Clean up partial file
-		os.Remove(localPath)
-		return wrapError("download", err)
-	}
-
-	// Preserve remote mtime so next diff sees files as in sync
-	if statErr == nil {
-		if err := os.Chtimes(localPath, entry.Time, entry.Time); err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: chtimes failed for %s: %v\n", localPath, err)
-		}
 	}
 
 	fmt.Fprintf(os.Stderr, "  downloaded: %s (%s)\n", localPath, HumanSize(n))

@@ -79,6 +79,8 @@ sfync on                        start the daemon
 sfync off                       stop the daemon
 ```
 
+Transfers are atomic: files are written to a hidden `.<name>.sfync-part` beside the destination and renamed into place only once complete, so a failed transfer never leaves a truncated file on the server or destroys your local copy. A leftover `.sfync-part` on the server is from an interrupted large upload; the next upload of that file resumes it.
+
 ## .syncignore
 
 Place a `.syncignore` in your project root. Supports [doublestar](https://github.com/bmatcuk/doublestar) glob syntax.
