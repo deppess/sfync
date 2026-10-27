@@ -58,8 +58,7 @@ func tofuCallback(verifyHostKey bool) (ssh.HostKeyCallback, error) {
 			return nil
 		}
 
-		var keyErr *knownhosts.KeyError
-		if errors.As(err, &keyErr) {
+		if keyErr, ok := errors.AsType[*knownhosts.KeyError](err); ok {
 			if len(keyErr.Want) > 0 {
 				// Host is known — check if this is a genuine key change
 				// or just a different key type (e.g., ecdsa vs ed25519)

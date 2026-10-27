@@ -90,11 +90,9 @@ func mountSSHFS(profile *config.Profile, mountPoint string) error {
 	// Wait() returns an empty result.
 	var stderrBuf bytes.Buffer
 	var stderrWg sync.WaitGroup
-	stderrWg.Add(1)
-	go func() {
-		defer stderrWg.Done()
+	stderrWg.Go(func() {
 		io.Copy(&stderrBuf, stderr) //nolint:errcheck // best-effort drain
-	}()
+	})
 
 	// Wait for command to complete
 	if err := cmd.Wait(); err != nil {

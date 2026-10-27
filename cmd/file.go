@@ -90,8 +90,8 @@ func Pull(profileName, filePath string) error {
 		// Try interpreting it as an absolute remote path under profile.RemotePath.
 		remotePosix := path.Clean(filepath.ToSlash(filePath))
 		remoteBase := path.Clean(profile.RemotePath)
-		if strings.HasPrefix(remotePosix, remoteBase+"/") {
-			relPath = strings.TrimPrefix(remotePosix, remoteBase+"/")
+		if after, ok := strings.CutPrefix(remotePosix, remoteBase+"/"); ok {
+			relPath = after
 			absFile = filepath.Join(profile.Context, filepath.FromSlash(relPath))
 		} else {
 			return fmt.Errorf("path '%s' is neither within local context '%s' nor under remote path '%s'",
