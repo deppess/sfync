@@ -47,6 +47,8 @@ type fakeRemote struct {
 	remote                map[string]bool
 	dirNotEmpty           bool
 	calls                 []string
+	mkdirs                int // MkdirAll calls
+	failUploads           int // upload attempts to fail before succeeding
 }
 
 func (f *fakeRemote) Stat(p string) (*transfer.RemoteFileInfo, error) {
@@ -64,9 +66,13 @@ func (f *fakeRemote) RemoveDir(p string) error {
 	}
 	return nil
 }
-func (f *fakeRemote) MkdirAll(p string) error { return nil }
+func (f *fakeRemote) MkdirAll(p string) error { f.mkdirs++; return nil }
 func (f *fakeRemote) Upload(l, r string) error {
 	f.calls = append(f.calls, "upload "+r)
+	if f.failUploads > 0 {
+		f.failUploads--
+		return errors.New("connection reset")
+	}
 	return nil
 }
 
@@ -175,5 +181,41 @@ func TestPresentFileIsUploadedEvenWithDeletesOn(t *testing.T) {
 	}
 	if len(r.successes) != 1 || r.successes[0] != "index.html" {
 		t.Errorf("result = %+v", r)
+	}
+}
+
+// Repeated uploads into the same remote directory ensure it only once; a
+// failed upload forgets it so the retry checks again.
+func TestQueueRemembersEnsuredDirectories(t *testing.T) {
+	ctx := t.TempDir()
+	os.MkdirAll(filepath.Join(ctx, "css"), 0o755)
+	for _, f := range []string{"css/a.css", "css/b.css", "css/c.css"} {
+		os.WriteFile(filepath.Join(ctx, f), []byte("x"), 0o644)
+	}
+	src := &fakeSource{client: &fakeRemote{remote: map[string]bool{}}}
+	q := NewUploadQueue(map[string]*config.Profile{"p": {Context: ctx, RemotePath: "/r"}}, src)
+	ok := func(string, string) {}
+	fail := func(_, rel string, err error, _ int) { t.Errorf("upload %s failed: %v", rel, err) }
+
+	for _, f := range []string{"css/a.css", "css/b.css", "css/c.css"} {
+		q.processUpload(&uploadTask{profileName: "p", filePath: filepath.Join(ctx, f)}, ok, fail)
+	}
+	if m := src.client.mkdirs; m != 1 {
+		t.Errorf("MkdirAll called %d times for 3 uploads into one directory, want 1", m)
+	}
+
+	// A failed upload (e.g. the directory vanished remotely) forgets it:
+	// the retry must ensure the directory again.
+	src.client.failUploads = 1
+	q.processUpload(&uploadTask{profileName: "p", filePath: filepath.Join(ctx, "css/a.css")}, ok, fail)
+	if m := src.client.mkdirs; m != 2 {
+		t.Errorf("after a failed upload, MkdirAll calls = %d, want 2 (re-ensured on retry)", m)
+	}
+
+	// A config reload forgets everything.
+	q.UpdateProfiles(map[string]*config.Profile{"p": {Context: ctx, RemotePath: "/r"}})
+	q.processUpload(&uploadTask{profileName: "p", filePath: filepath.Join(ctx, "css/b.css")}, ok, fail)
+	if m := src.client.mkdirs; m != 3 {
+		t.Errorf("after reload, MkdirAll calls = %d, want 3", m)
 	}
 }
