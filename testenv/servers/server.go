@@ -28,12 +28,13 @@ type Server struct {
 	// Net is the emulated network profile between client and server.
 	Net netem.Profile
 
-	host     string
-	port     int
-	protocol string
-	username string
-	password string
-	sshKey   string
+	host      string
+	port      int
+	protocol  string
+	username  string
+	password  string
+	sshKey    string
+	tlsCACert string
 }
 
 // Profile returns an sfync profile for this server, syncing context
@@ -51,6 +52,7 @@ func (s *Server) Profile(context string) *config.Profile {
 		RemotePath:    s.RemoteRoot,
 		Context:       context,
 		VerifyHostKey: &verify,
+		TLSCACert:     s.tlsCACert,
 	}
 	p.SetDefaults()
 	return p
