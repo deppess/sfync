@@ -13,6 +13,7 @@ require (
 
 require (
 	github.com/bmatcuk/doublestar/v4 v4.10.4 // indirect
+	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/jlaffaye/ftp v0.2.4 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
