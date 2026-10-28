@@ -38,10 +38,21 @@ var allServers = map[string]servers.Starter{
 }
 
 // TestMain silences sfync's per-file progress output (written straight to
-// os.Stderr) so terminal I/O doesn't distort timings.
+// os.Stderr) so terminal I/O doesn't distort timings. SFYNC_BENCH_VERBOSE
+// keeps it, e.g. to see the raw "debug:" errors behind a failure: "1" for
+// the terminal, or a file path to append to (cheaper, so it perturbs
+// timing-sensitive failures less).
 func TestMain(m *testing.M) {
-	if devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0); err == nil {
-		os.Stderr = devnull
+	switch v := os.Getenv("SFYNC_BENCH_VERBOSE"); v {
+	case "1":
+	case "":
+		if devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0); err == nil {
+			os.Stderr = devnull
+		}
+	default:
+		if f, err := os.OpenFile(v, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644); err == nil {
+			os.Stderr = f
+		}
 	}
 	os.Exit(m.Run())
 }
@@ -78,6 +89,7 @@ func eachCase(b *testing.B, fn func(b *testing.B, start servers.Starter, net net
 					b.Fatalf("unknown fixture %q", fixName)
 				}
 				b.Run(fmt.Sprintf("server=%s/net=%s/fixture=%s", srvName, netName, fixName), func(b *testing.B) {
+					drainSockets(b)
 					fn(b, start, net, spec)
 				})
 			}
@@ -146,6 +158,7 @@ func BenchmarkUpCold(b *testing.B) {
 		for b.Loop() {
 			b.StopTimer()
 			emptyDir(b, srv.Root)
+			drainSockets(b)
 			b.StartTimer()
 			res, err := transfer.MirrorUp(c, profile, false)
 			checkResult(b, res, err)
@@ -165,6 +178,7 @@ func BenchmarkUpNoop(b *testing.B) {
 		c := connect(b, srv, local)
 		res, err := transfer.MirrorUp(c, profile, false) // populate remote
 		checkResult(b, res, err)
+		drainSockets(b)
 		b.ResetTimer()
 		for b.Loop() {
 			res, err := transfer.MirrorUp(c, profile, false)
@@ -197,6 +211,7 @@ func BenchmarkDownCold(b *testing.B) {
 		for b.Loop() {
 			b.StopTimer()
 			emptyDir(b, local)
+			drainSockets(b)
 			b.StartTimer()
 			res, err := transfer.MirrorDown(c, profile, false)
 			checkResult(b, res, err)
