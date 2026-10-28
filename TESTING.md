@@ -24,7 +24,7 @@ The harness is a separate Go module, `testenv/`. Its test-only dependencies (an 
 | `testenv/servers` | Starts servers on demand. **Real OpenSSH**: the system `/usr/sbin/sshd`, run as you with no root and key-only auth, using `internal-sftp`. **In-process SFTP**: `pkg/sftp`. **In-process FTP**: `ftpserverlib`, optionally without MFMT, or LIST-only like vsftpd. |
 | `testenv/netem` | Userspace network emulation: added round-trip latency and bandwidth caps over real loopback TCP. FTP passive data connections are shaped too. |
 | `testenv/fixtures` | Deterministic, incompressible file trees, cached in the temp dir: `website` (1200 small files), `mixed`, `deep` (300 nested dirs), `large` (4 × ~28 MB). |
-| `testenv/integration` | sfync's sync engine end to end against every server kind. |
+| `testenv/integration` | sfync's sync engine end to end against every server kind, and the built `sfync` binary run as a user would (isolated `HOME`, notifications off). |
 | `testenv/bench` | Benchmarks: cold upload, no-op upload, cold download, connect. |
 
 ## Benchmark matrix
