@@ -37,6 +37,15 @@ var (
 	buildErr  error
 )
 
+// TestMain removes the sfync binary built for the CLI tests.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if binPath != "" {
+		os.RemoveAll(filepath.Dir(binPath))
+	}
+	os.Exit(code)
+}
+
 // sfyncBinary builds sfync once per test run.
 func sfyncBinary(t *testing.T) string {
 	t.Helper()
