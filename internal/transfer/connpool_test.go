@@ -238,3 +238,41 @@ func TestSessionBroken(t *testing.T) {
 		})
 	}
 }
+
+// Regression: concurrent acquires on an empty pool whose dials all fail
+// (a server allowing no extra sessions) must all return the error. Counting
+// in-flight dials as open connections made all but the last failure think
+// connections existed, cap the pool and wait forever.
+func TestConnPoolAllDialsFailConcurrently(t *testing.T) {
+	h := newPoolHarness(4)
+	h.failAt.Store(1)
+	gate := make(chan struct{})
+	h.pool.dial = func() (*fakeConn, error) {
+		<-gate // hold every dial until all four are in flight
+		h.dials.Add(1)
+		return nil, errors.New("channel open rejected")
+	}
+
+	errs := make(chan error, 4)
+	for range 4 {
+		go func() {
+			_, err := h.pool.acquire()
+			errs <- err
+		}()
+	}
+	time.Sleep(50 * time.Millisecond) // let all four start dialing
+	close(gate)
+	for i := range 4 {
+		select {
+		case err := <-errs:
+			if err == nil {
+				t.Errorf("acquire %d succeeded with no possible connection", i)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("acquire %d hung: waiting for a connection that can never exist", i)
+		}
+	}
+	if got := h.dials.Load(); got != 4 {
+		t.Errorf("dials = %d, want 4 (waiters must not redial a server that just refused)", got)
+	}
+}

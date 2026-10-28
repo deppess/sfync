@@ -23,13 +23,15 @@ var errPoolClosed = errors.New("connection pool closed")
 // instead of failing. Only failing to open the very first connection is an
 // error — exactly as with a single connection.
 type connPool[C any] struct {
-	mu     sync.Mutex
-	cond   *sync.Cond
-	idle   []C
-	open   int // connections in existence: idle + checked out
-	limit  int
-	capped bool
-	closed bool
+	mu      sync.Mutex
+	cond    *sync.Cond
+	idle    []C
+	open    int   // connections in existence or being dialed (counts against limit)
+	dialing int   // of open, how many are still being dialed
+	dialErr error // last dial failure while nothing was open; nil once one succeeds
+	limit   int
+	capped  bool
+	closed  bool
 
 	dial  func() (C, error)
 	close func(C)
@@ -59,6 +61,7 @@ func (p *connPool[C]) acquire() (C, error) {
 	var zero C
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	waited := false
 	for {
 		if p.closed {
 			return zero, errPoolClosed
@@ -68,12 +71,22 @@ func (p *connPool[C]) acquire() (C, error) {
 			p.idle = p.idle[:n-1]
 			return c, nil
 		}
+		// This caller waited through a failure that left nothing
+		// established and nothing being dialed: no connection is coming,
+		// and redialing the server that just refused would only repeat it.
+		// (A fresh acquire, which didn't witness it, may try again.)
+		if waited && p.open == 0 && p.dialErr != nil {
+			return zero, p.dialErr
+		}
 		if p.open < p.limit {
 			p.open++
+			p.dialing++
 			p.mu.Unlock()
 			c, err := p.dial() // network I/O outside the lock
 			p.mu.Lock()
+			p.dialing--
 			if err == nil {
+				p.dialErr = nil
 				if p.closed {
 					p.open--
 					go p.close(c)
@@ -82,22 +95,28 @@ func (p *connPool[C]) acquire() (C, error) {
 				return c, nil
 			}
 			p.open--
-			if p.open == 0 {
-				return zero, err // no connection at all: a real failure
+			p.cond.Broadcast() // state changed: waiters must re-evaluate
+			established := p.open - p.dialing
+			if established == 0 {
+				// Nothing usable exists. Other dials may still be in flight
+				// and could succeed; if none are, this failure is everyone's.
+				p.dialErr = err
+				return zero, err
 			}
 			// The server accepts fewer connections than configured (or
 			// briefly couldn't take another): stop growing and share the
-			// ones that work.
+			// ones that work. Dials still in flight keep their slots.
 			p.limit = p.open
 			if !p.capped {
 				p.capped = true
 				if p.onCap != nil {
-					p.onCap(p.limit)
+					p.onCap(established)
 				}
 			}
 			continue
 		}
 		p.cond.Wait()
+		waited = true
 	}
 }
 
