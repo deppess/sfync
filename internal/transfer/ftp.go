@@ -21,6 +21,13 @@ import (
 type ftpClient struct {
 	profile *config.Profile
 	conn    *ftp.ServerConn
+
+	// LIST timestamps carry no timezone; many servers list in their local
+	// time. listOffset is how far the server's LIST times are ahead of UTC,
+	// detected once per connection (see detectListOffset).
+	listOffset      time.Duration
+	listOffsetKnown bool
+	listOffsetTries int
 }
 
 func newFTPClient(profile *config.Profile) *ftpClient {
@@ -55,6 +62,7 @@ func (c *ftpClient) Connect() error {
 	}
 
 	c.conn = conn
+	c.listOffset, c.listOffsetKnown, c.listOffsetTries = 0, false, 0
 	return nil
 }
 
@@ -90,7 +98,8 @@ func (c *ftpClient) Stat(remotePath string) (*RemoteFileInfo, error) {
 	if err != nil {
 		return nil, wrapError("stat", err)
 	}
-	return ftpEntryToRemote(entry, ""), nil
+	c.detectListOffset(remotePath, entry)
+	return c.toRemote(entry), nil
 }
 
 // ReadDir lists entries in a remote directory, skipping symlinks
@@ -98,6 +107,14 @@ func (c *ftpClient) ReadDir(remotePath string) ([]RemoteFileInfo, error) {
 	entries, err := c.conn.List(remotePath)
 	if err != nil {
 		return nil, wrapError("readdir", err)
+	}
+
+	if !c.listOffsetKnown {
+		for _, entry := range entries {
+			if c.detectListOffset(RemotePath(remotePath, entry.Name), entry) {
+				break
+			}
+		}
 	}
 
 	var result []RemoteFileInfo
@@ -113,7 +130,7 @@ func (c *ftpClient) ReadDir(remotePath string) ([]RemoteFileInfo, error) {
 			fmt.Fprintf(os.Stderr, "  warning: skipping unsafe remote entry name %q in %s\n", entry.Name, remotePath)
 			continue
 		}
-		result = append(result, *ftpEntryToRemote(entry, ""))
+		result = append(result, *c.toRemote(entry))
 	}
 	return result, nil
 }
@@ -339,12 +356,93 @@ func (c *ftpClient) Chmod(_ string, _ os.FileMode) error {
 }
 
 // ftpEntryToRemote converts an ftp.Entry to RemoteFileInfo
-func ftpEntryToRemote(entry *ftp.Entry, relPath string) *RemoteFileInfo {
-	return &RemoteFileInfo{
-		Name:    entry.Name,
-		Path:    relPath,
-		Size:    int64(entry.Size),
-		ModTime: entry.Time,
-		IsDir:   entry.Type == ftp.EntryTypeFolder,
+func (c *ftpClient) toRemote(entry *ftp.Entry) *RemoteFileInfo {
+	precise := c.conn.IsTimePreciseInList()
+	mtime := entry.Time
+	if !precise {
+		mtime = mtime.Add(-c.listOffset)
 	}
+	return &RemoteFileInfo{
+		Name:             entry.Name,
+		Size:             int64(entry.Size),
+		ModTime:          mtime,
+		IsDir:            entry.Type == ftp.EntryTypeFolder,
+		ModTimePrecision: listTimePrecision(mtime, precise, time.Now()),
+	}
+}
+
+// maxListOffsetTries bounds MDTM probes when they keep failing, so a server
+// with a broken MDTM costs at most a few extra round trips per connection.
+const maxListOffsetTries = 3
+
+// detectListOffset works out the server's LIST timezone offset from one
+// file, reporting whether the offset is now known. LIST times have no
+// timezone and many servers emit local time, while MDTM is defined to be
+// UTC (RFC 3659) — so for a recent file (listed to the minute), the LIST
+// time minus its MDTM time is the server's offset, give or take the
+// truncated seconds. Rounded to 15 minutes, the granularity of real
+// timezones. Costs one MDTM round trip per connection. Without detection,
+// a server listing in UTC-7 would make every file look 7 hours off and
+// get re-uploaded on every sync.
+func (c *ftpClient) detectListOffset(remotePath string, entry *ftp.Entry) bool {
+	if c.listOffsetKnown {
+		return true
+	}
+	if c.conn.IsTimePreciseInList() || !c.conn.IsGetTimeSupported() {
+		c.listOffsetKnown = true // nothing to correct, or no way to tell
+		return true
+	}
+	// Need a file listed with minute precision (a recent one): date-only
+	// entries for older files can't pin the offset down. Its listed time may
+	// be skewed by up to ±14h before correction, hence the widened "now".
+	if entry.Type != ftp.EntryTypeFile || c.listOffsetTries >= maxListOffsetTries ||
+		listTimePrecision(entry.Time, false, time.Now().Add(14*time.Hour)) != time.Minute {
+		return false
+	}
+	c.listOffsetTries++
+	mdtm, err := c.conn.GetTime(remotePath)
+	if err != nil {
+		return false
+	}
+	offset, ok := listOffsetFrom(entry.Time, mdtm)
+	if !ok {
+		return false // implausible; MDTM or LIST is lying
+	}
+	c.listOffset = offset
+	c.listOffsetKnown = true
+	if offset != 0 {
+		fmt.Fprintf(os.Stderr, "  note: %s lists file times in UTC%+gh (detected); adjusting\n",
+			c.profile.Host, offset.Hours())
+	}
+	return true
+}
+
+// listTimePrecision is the granularity of an entry's timestamp. MLSD/MLST
+// times are exact. Unix-style LIST shows "Jan _2 15:04" (minute precision)
+// for files modified within the last six months and "Jan _2  2006" (date
+// only, parsed as midnight) for older ones. The six-month cutoff is decided
+// by the server's clock, so anything older than five months is treated as
+// date-only — slightly looser for files 5-6 months old, never wrong.
+func listTimePrecision(t time.Time, preciseTimes bool, now time.Time) time.Duration {
+	switch {
+	case preciseTimes:
+		return 0
+	case now.Sub(t) > 150*24*time.Hour:
+		return 24 * time.Hour
+	default:
+		return time.Minute
+	}
+}
+
+// listOffsetFrom derives a server's LIST timezone offset from one file's
+// LIST time (local wall clock, truncated to the minute, parsed as if UTC)
+// and its MDTM time (true UTC). The truncation makes the raw difference up
+// to 59s short of the true offset; rounding to 15 minutes — the granularity
+// of real timezones (e.g. UTC+5:30, UTC+5:45) — removes it.
+func listOffsetFrom(listed, mdtm time.Time) (time.Duration, bool) {
+	offset := listed.Sub(mdtm).Round(15 * time.Minute)
+	if offset < -14*time.Hour || offset > 14*time.Hour {
+		return 0, false
+	}
+	return offset, true
 }

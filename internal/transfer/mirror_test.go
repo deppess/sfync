@@ -71,6 +71,44 @@ func TestIsDifferent(t *testing.T) {
 			remote: &RemoteFileInfo{Size: 100, ModTime: epoch.Add(-3 * time.Second)},
 			want:   true,
 		},
+		// FTP LIST: remote time truncated to the minute.
+		{
+			name:   "minute precision: local seconds within the listed minute",
+			local:  mockFileInfo{size: 100, modTime: epoch.Add(37 * time.Second)},
+			remote: &RemoteFileInfo{Size: 100, ModTime: epoch, ModTimePrecision: time.Minute},
+			want:   false,
+		},
+		{
+			name:   "minute precision: local in the next minute",
+			local:  mockFileInfo{size: 100, modTime: epoch.Add(65 * time.Second)},
+			remote: &RemoteFileInfo{Size: 100, ModTime: epoch, ModTimePrecision: time.Minute},
+			want:   true,
+		},
+		{
+			name:   "minute precision: local before the listed minute",
+			local:  mockFileInfo{size: 100, modTime: epoch.Add(-10 * time.Second)},
+			remote: &RemoteFileInfo{Size: 100, ModTime: epoch, ModTimePrecision: time.Minute},
+			want:   true,
+		},
+		{
+			name:   "minute precision: size still compared exactly",
+			local:  mockFileInfo{size: 101, modTime: epoch.Add(10 * time.Second)},
+			remote: &RemoteFileInfo{Size: 100, ModTime: epoch, ModTimePrecision: time.Minute},
+			want:   true,
+		},
+		// FTP LIST for old files: date only, parsed as midnight.
+		{
+			name:   "day precision: same day",
+			local:  mockFileInfo{size: 100, modTime: epoch.Add(9 * time.Hour)},
+			remote: &RemoteFileInfo{Size: 100, ModTime: epoch.Truncate(24 * time.Hour), ModTimePrecision: 24 * time.Hour},
+			want:   false,
+		},
+		{
+			name:   "day precision: next day",
+			local:  mockFileInfo{size: 100, modTime: epoch.Truncate(24 * time.Hour).Add(25 * time.Hour)},
+			remote: &RemoteFileInfo{Size: 100, ModTime: epoch.Truncate(24 * time.Hour), ModTimePrecision: 24 * time.Hour},
+			want:   true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -297,5 +335,56 @@ func TestSortActions(t *testing.T) {
 	}
 	if pos["file.txt"] >= pos["a/b/c"] {
 		t.Error("delete should precede deletedir")
+	}
+}
+
+func TestListTimePrecision(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name    string
+		t       time.Time
+		precise bool
+		want    time.Duration
+	}{
+		{"MLSD is exact", now.AddDate(-2, 0, 0), true, 0},
+		{"recent LIST entry", now.Add(-48 * time.Hour), false, time.Minute},
+		{"old LIST entry (date only)", now.AddDate(0, -7, 0), false, 24 * time.Hour},
+		{"5-6 months old treated as date-only", now.AddDate(0, -5, -15), false, 24 * time.Hour},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := listTimePrecision(tc.t, tc.precise, now); got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestListOffsetFrom(t *testing.T) {
+	utc := time.Date(2026, 10, 27, 20, 14, 37, 0, time.UTC)
+	tests := []struct {
+		name   string
+		offset time.Duration
+	}{
+		{"UTC", 0},
+		{"PDT (UTC-7)", -7 * time.Hour},
+		{"CET (UTC+1)", time.Hour},
+		{"India (UTC+5:30)", 5*time.Hour + 30*time.Minute},
+		{"Nepal (UTC+5:45)", 5*time.Hour + 45*time.Minute},
+		{"Kiribati (UTC+14)", 14 * time.Hour},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// What a LIST shows: server wall clock, truncated to the minute,
+			// parsed as UTC by the client.
+			listed := utc.Add(tc.offset).Truncate(time.Minute)
+			got, ok := listOffsetFrom(listed, utc)
+			if !ok || got != tc.offset {
+				t.Errorf("got %v ok=%v, want %v", got, ok, tc.offset)
+			}
+		})
+	}
+	if _, ok := listOffsetFrom(utc.Add(20*time.Hour), utc); ok {
+		t.Error("20h offset accepted as plausible")
 	}
 }

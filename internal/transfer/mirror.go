@@ -382,13 +382,13 @@ func isDifferent(local os.FileInfo, remote *RemoteFileInfo) bool {
 	if local.Size() != remote.Size {
 		return true
 	}
-	// ModTime differs by more than 2 seconds → different
-	// 2-second tolerance handles FTP timestamp precision and filesystem rounding
+	// The remote time is truncated to its precision, so the true remote
+	// mtime lies in [ModTime, ModTime+precision). In sync if the local mtime
+	// falls in that window, plus 2 seconds of slack either side for
+	// filesystem rounding (FAT-style 2s granularity, sub-second truncation).
+	const slack = 2 * time.Second
 	diff := local.ModTime().Sub(remote.ModTime)
-	if diff < 0 {
-		diff = -diff
-	}
-	return diff > 2*time.Second
+	return diff < -slack || diff > remote.ModTimePrecision+slack
 }
 
 // sortActions orders actions for safe execution:
