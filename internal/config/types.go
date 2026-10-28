@@ -24,7 +24,25 @@ type Profile struct {
 	// mirrored to the server.
 	AutoSyncDeletes bool  `json:"autoSyncDeletes"`
 	VerifyHostKey   *bool `json:"verifyHostKey"` // nil = default true (TOFU)
+	// FTPConnections caps how many parallel control connections an FTP/FTPS
+	// profile may open (FTP allows one command in flight per connection, so
+	// this is its parallelism). Extra connections open only when work runs
+	// in parallel, and sfync caps itself lower if the server refuses one.
+	// 1 = a single connection. Ignored for SFTP, which multiplexes requests
+	// over one connection.
+	FTPConnections int `json:"ftpConnections"`
+	// TLSCACert is a PEM file of CA certificates to verify an FTPS server
+	// against instead of the system roots — for servers with a private CA
+	// or self-signed certificate. The hostname is still verified. Ignored
+	// for sftp and plain ftp.
+	TLSCACert string `json:"tlsCACert"`
 }
+
+// Bounds for FTPConnections.
+const (
+	DefaultFTPConnections = 4
+	MaxFTPConnections     = 16
+)
 
 // Config represents the entire configuration file
 type Config struct {
@@ -43,6 +61,10 @@ func (p *Profile) Validate() error {
 	if p.Protocol != "ftp" && p.Protocol != "ftps" && p.Protocol != "sftp" {
 		return ErrInvalidProtocol
 	}
+	if p.FTPConnections < 0 || p.FTPConnections > MaxFTPConnections {
+		return ErrInvalidFTPConnections
+	}
+
 	// Validate port
 	if p.Port < 1 || p.Port > 65535 {
 		return ErrInvalidPort
@@ -84,8 +106,12 @@ func (p *Profile) SetDefaults() {
 	if p.AutoSyncDebounce == 0 {
 		p.AutoSyncDebounce = 2000 // 2 seconds default
 	}
+	if p.FTPConnections == 0 && p.Protocol != "sftp" {
+		p.FTPConnections = DefaultFTPConnections
+	}
 	p.SSHKey = ExpandHome(p.SSHKey)
 	p.Context = ExpandHome(p.Context)
+	p.TLSCACert = ExpandHome(p.TLSCACert)
 }
 
 // ExpandHome expands a leading "~" or "~/" to the current user's home
