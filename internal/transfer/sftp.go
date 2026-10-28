@@ -536,6 +536,16 @@ func (c *sftpClient) Mkdir(remotePath string) error {
 
 // MkdirAll creates a remote directory and all parents
 func (c *sftpClient) MkdirAll(remotePath string) error {
+	// Fast path: the directory almost always exists already (the daemon
+	// and push call MkdirAll before every upload). One stat of the full
+	// path answers that, instead of a stat per path component.
+	endOp := c.deadlines.begin(OperationTimeout)
+	info, err := c.sftpClient.Stat(remotePath)
+	endOp()
+	if err == nil && info.IsDir() {
+		return nil
+	}
+
 	// SFTP has no native MkdirAll — walk components.
 	// Each Stat+Mkdir pair gets its own deadline so a deep directory tree
 	// cannot exhaust a single shared budget.

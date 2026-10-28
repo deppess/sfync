@@ -425,6 +425,20 @@ func (c *ftpClient) Mkdir(remotePath string) error {
 // MkdirAll creates a remote directory and all parents
 func (c *ftpClient) MkdirAll(remotePath string) error {
 	return c.withConn("mkdir", OperationTimeout, func(conn *ftpSession) error {
+		// Fast path: the directory almost always exists already (the daemon
+		// and push call MkdirAll before every upload). With MLST — exact
+		// metadata for one path — a single command answers that; the
+		// component walk below costs up to four commands per component.
+		// (Without MLST, GetEntry falls back to LIST, which for a directory
+		// lists its contents rather than describing it, so it can't be used.)
+		if conn.IsTimePreciseInList() {
+			if entry, err := conn.GetEntry(remotePath); err == nil && entry.Type == ftp.EntryTypeFolder {
+				return nil
+			} else if sessionBroken(err) && err != nil {
+				return wrapError("mkdir", err)
+			}
+		}
+
 		components := strings.Split(remotePath, "/")
 		current := ""
 

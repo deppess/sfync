@@ -24,6 +24,13 @@ type UploadQueue struct {
 	profiles   map[string]*config.Profile
 	profilesMu sync.RWMutex
 	clients    clientSource
+
+	// knownDirs remembers remote directories already ensured, keyed by
+	// profile + "\x00" + dir, so repeated uploads skip MkdirAll. Cleared
+	// for a profile when an upload fails or a remote directory is deleted,
+	// and entirely on config reload.
+	knownDirs map[string]bool
+	dirsMu    sync.Mutex
 }
 
 // clientSource hands out live connections per profile — satisfied by
@@ -185,6 +192,10 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 
 		if missing {
 			deleted, delErr := deleteRemote(client, remotePath, relPath)
+			if deleted {
+				// A deleted directory invalidates remembered ones under it.
+				q.forgetDirs(task.profileName)
+			}
 			if delErr == nil {
 				if deleted {
 					onSuccess(task.profileName, relPath+" (deleted)")
@@ -203,9 +214,13 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 			continue
 		}
 
-		// Upload/UploadResume assume the remote directory already exists —
-		// ensure it does before every attempt (cheap no-op once created).
-		if mkErr := client.MkdirAll(path.Dir(remotePath)); mkErr != nil {
+		// Upload/UploadResume assume the remote directory already exists.
+		// Once ensured, remember it: repeated saves into the same folder —
+		// the daemon's common case — then skip the check's round trips.
+		remoteDir := path.Dir(remotePath)
+		if q.dirKnown(task.profileName, remoteDir) {
+			// already ensured
+		} else if mkErr := client.MkdirAll(remoteDir); mkErr != nil {
 			lastErr = mkErr
 			if attempt < maxRetries-1 {
 				fmt.Fprintf(os.Stderr, "Directory creation failed (attempt %d/%d): %s - %v\n", attempt+1, maxRetries, relPath, mkErr)
@@ -217,6 +232,8 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 			}
 			continue
 		}
+
+		q.rememberDir(task.profileName, remoteDir)
 
 		// Use resume for large files (mirrors mirror.go behaviour)
 		var uploadErr error
@@ -231,6 +248,9 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 		}
 
 		lastErr = uploadErr
+		// The directory may have been removed remotely since it was
+		// remembered: re-check it on the next attempt.
+		q.forgetDirs(task.profileName)
 
 		if attempt < maxRetries-1 {
 			fmt.Fprintf(os.Stderr, "Upload failed (attempt %d/%d): %s - %v\n", attempt+1, maxRetries, relPath, uploadErr)
@@ -288,6 +308,35 @@ func (q *UploadQueue) Stop() {
 // UpdateProfiles atomically replaces the profile map used by the queue.
 func (q *UploadQueue) UpdateProfiles(profiles map[string]*config.Profile) {
 	q.profilesMu.Lock()
-	defer q.profilesMu.Unlock()
 	q.profiles = profiles
+	q.profilesMu.Unlock()
+	q.forgetDirs("") // remotePath or server may have changed
+}
+
+// dirKnown reports whether remoteDir was already ensured for profile.
+func (q *UploadQueue) dirKnown(profile, remoteDir string) bool {
+	q.dirsMu.Lock()
+	defer q.dirsMu.Unlock()
+	return q.knownDirs[profile+"\x00"+remoteDir]
+}
+
+// rememberDir records that remoteDir exists for profile.
+func (q *UploadQueue) rememberDir(profile, remoteDir string) {
+	q.dirsMu.Lock()
+	defer q.dirsMu.Unlock()
+	if q.knownDirs == nil {
+		q.knownDirs = make(map[string]bool)
+	}
+	q.knownDirs[profile+"\x00"+remoteDir] = true
+}
+
+// forgetDirs drops remembered directories for profile ("" = all profiles).
+func (q *UploadQueue) forgetDirs(profile string) {
+	q.dirsMu.Lock()
+	defer q.dirsMu.Unlock()
+	for k := range q.knownDirs {
+		if profile == "" || strings.HasPrefix(k, profile+"\x00") {
+			delete(q.knownDirs, k)
+		}
+	}
 }
