@@ -55,14 +55,14 @@ func MirrorUp(client RemoteClient, profile *config.Profile, dryRun bool) (*Mirro
 
 	// Diff
 	actions := diffTrees(local, remote, true)
-	actions = sortActions(actions)
 
-	// Count skips
+	// Count skips before sortActions, which drops them
 	for _, a := range actions {
 		if a.Action == ActionSkip {
 			result.Skipped++
 		}
 	}
+	actions = sortActions(actions)
 
 	// Dry run — return actions without executing
 	if dryRun {
@@ -110,14 +110,14 @@ func MirrorDown(client RemoteClient, profile *config.Profile, dryRun bool) (*Mir
 
 	// Diff
 	actions := diffTrees(local, remote, false)
-	actions = sortActions(actions)
 
-	// Count skips
+	// Count skips before sortActions, which drops them
 	for _, a := range actions {
 		if a.Action == ActionSkip {
 			result.Skipped++
 		}
 	}
+	actions = sortActions(actions)
 
 	// Dry run
 	if dryRun {
