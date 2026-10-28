@@ -108,5 +108,6 @@ func profileChanged(old, newP *config.Profile) bool {
 		old.Username != newP.Username ||
 		old.Password != newP.Password ||
 		old.SSHKey != newP.SSHKey ||
-		old.Protocol != newP.Protocol
+		old.Protocol != newP.Protocol ||
+		old.FTPConnections != newP.FTPConnections
 }

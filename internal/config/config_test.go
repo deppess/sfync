@@ -158,3 +158,35 @@ func TestSetDefaultsExpandsHome(t *testing.T) {
 		t.Errorf("Context = %q", p.Context)
 	}
 }
+
+func TestFTPConnectionsDefaultsAndValidation(t *testing.T) {
+	for proto, want := range map[string]int{"ftp": DefaultFTPConnections, "ftps": DefaultFTPConnections, "sftp": 0} {
+		p := Profile{Protocol: proto}
+		p.SetDefaults()
+		if p.FTPConnections != want {
+			t.Errorf("%s: FTPConnections = %d, want %d", proto, p.FTPConnections, want)
+		}
+	}
+
+	explicit := Profile{Protocol: "ftp", FTPConnections: 1}
+	explicit.SetDefaults()
+	if explicit.FTPConnections != 1 {
+		t.Errorf("explicit 1 overwritten: %d", explicit.FTPConnections)
+	}
+
+	base := Profile{Host: "h", Username: "u", Password: "p", Protocol: "ftp", Port: 21}
+	for _, n := range []int{-1, MaxFTPConnections + 1} {
+		p := base
+		p.FTPConnections = n
+		if err := p.Validate(); !errors.Is(err, ErrInvalidFTPConnections) {
+			t.Errorf("ftpConnections=%d: Validate() = %v, want ErrInvalidFTPConnections", n, err)
+		}
+	}
+	for _, n := range []int{1, DefaultFTPConnections, MaxFTPConnections} {
+		p := base
+		p.FTPConnections = n
+		if err := p.Validate(); err != nil {
+			t.Errorf("ftpConnections=%d: unexpected %v", n, err)
+		}
+	}
+}

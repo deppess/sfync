@@ -101,6 +101,10 @@ const (
 	AliveTimeout     = 5 * time.Second
 	ResumeThreshold  = 10 * 1024 * 1024 // 10 MB — files above this use resume
 
+	// unknownSizeTransferTimeout bounds a download whose size the server
+	// won't report (neither MLST/LIST nor SIZE worked).
+	unknownSizeTransferTimeout = 10 * time.Minute
+
 	// MaxConcurrentReadDir bounds how many ReadDir calls walkRemote issues in
 	// parallel when the underlying client supports concurrent requests (SFTP
 	// only — see walkRemote in mirror.go). Each SFTP listing is ≥4 dependent
