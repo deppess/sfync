@@ -25,10 +25,8 @@ func Push(profileName, filePath string) error {
 		return fmt.Errorf("cannot resolve path '%s': %w", filePath, err)
 	}
 
-	// Check file is within context. filepath.Rel cleans both paths, so a
-	// context configured with a trailing slash still matches.
-	relPath, relErr := filepath.Rel(profile.Context, absFile)
-	if relErr != nil || relPath == "." || escapesBase(relPath) {
+	relPath, ok := contextRel(profile.Context, absFile)
+	if !ok {
 		notify.Error("SFTP Error", fmt.Sprintf("file '%s' is not within context '%s'", absFile, profile.Context))
 		return fmt.Errorf("file '%s' is not within context '%s'", absFile, profile.Context)
 	}
@@ -78,16 +76,18 @@ func Pull(profileName, filePath string) error {
 	var relPath string
 	absFile, _ := filepath.Abs(filePath)
 
-	rel, relErr := filepath.Rel(profile.Context, absFile)
-	if relErr == nil && !escapesBase(rel) {
+	if rel, ok := contextRel(profile.Context, absFile); ok {
 		// Path is within the local context — use it directly.
 		relPath = rel
 	} else {
 		// Path is outside the local context.
 		// Try interpreting it as an absolute remote path under profile.RemotePath.
 		remotePosix := path.Clean(filepath.ToSlash(filePath))
-		remoteBase := path.Clean(profile.RemotePath)
-		if after, ok := strings.CutPrefix(remotePosix, remoteBase+"/"); ok {
+		remotePrefix := path.Clean(profile.RemotePath)
+		if remotePrefix != "/" { // the root already ends in a slash
+			remotePrefix += "/"
+		}
+		if after, ok := strings.CutPrefix(remotePosix, remotePrefix); ok && after != "" {
 			relPath = after
 			absFile = filepath.Join(profile.Context, filepath.FromSlash(relPath))
 		} else {
@@ -125,6 +125,47 @@ func Pull(profileName, filePath string) error {
 // Current uploads the current file (editor integration alias for Push)
 func Current(profileName, filePath string) error {
 	return Push(profileName, filePath)
+}
+
+// contextRel returns absPath relative to the context directory, reporting
+// whether it lies strictly inside it. Paths are compared as given first,
+// then with symlinks resolved, since one directory often has two spellings:
+// on macOS /var is /private/var and the working directory comes back
+// resolved, and projects often live under a symlinked folder. Only the
+// parent of absPath is resolved — absPath itself may not exist yet (a pull
+// target), and if it is a symlink its own name is the one to sync.
+// filepath.Rel cleans both paths, so a trailing slash on the context is
+// fine.
+func contextRel(context, absPath string) (string, bool) {
+	if rel, ok := relInside(context, absPath); ok {
+		return rel, true
+	}
+	realContext, err := filepath.EvalSymlinks(context)
+	if err != nil {
+		return "", false
+	}
+	return relInside(realContext, filepath.Join(resolveExisting(filepath.Dir(absPath)), filepath.Base(absPath)))
+}
+
+// relInside is filepath.Rel(base, p) when p lies strictly inside base.
+func relInside(base, p string) (string, bool) {
+	rel, err := filepath.Rel(base, p)
+	if err != nil || rel == "." || escapesBase(rel) {
+		return "", false
+	}
+	return rel, true
+}
+
+// resolveExisting resolves symlinks in the longest existing prefix of p.
+func resolveExisting(p string) string {
+	if real, err := filepath.EvalSymlinks(p); err == nil {
+		return real
+	}
+	parent := filepath.Dir(p)
+	if parent == p {
+		return p
+	}
+	return filepath.Join(resolveExisting(parent), filepath.Base(p))
 }
 
 // escapesBase reports whether rel, a path from filepath.Rel, points outside
