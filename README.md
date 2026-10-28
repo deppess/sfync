@@ -54,7 +54,7 @@ cp sfync /opt/homebrew/bin/sfync      # macOS on Apple Silicon
 
 FTP and FTPS options:
 
-- `ftpConnections` (default `4`, maximum `16`) is how many parallel connections sfync may open. FTP runs one command at a time per connection, so this is FTP's parallelism. Extra connections open only when work runs in parallel. If the server refuses one (many shared hosts limit connections per user), sfync stays at what it has and carries on. Set `1` for a single connection.
+- `ftpConnections` (default `8`, maximum `16`) is how many parallel connections sfync may open. FTP runs one command at a time per connection, so this is FTP's parallelism. Extra connections open only when work runs in parallel. If the server refuses one (many shared hosts limit connections per user), sfync stays at what it has and carries on. Set `1` for a single connection.
 - `tlsCACert` (FTPS only) is a PEM file of the CA that signed the server's certificate, for servers with a private CA or a self-signed certificate. The server is then verified against it instead of the system roots. The hostname is still checked. FTP/FTPS require `password`. Passwords are stored in plaintext — `chmod 600 ~/.config/sfync/config.json`.
 
 ## Commands
