@@ -83,6 +83,14 @@ func (w *Watcher) invalidatePatterns(contextPath string) {
 
 // Watch starts watching a profile's context directory
 func (w *Watcher) Watch(profileName string, profile *config.Profile, callback func(filePath string)) error {
+	// Work on a copy with the context path cleaned: fsnotify reports clean
+	// paths, and every comparison here (which profile a file belongs to, the
+	// .syncignore cache key) assumes the same form — a context configured
+	// with a trailing slash would otherwise match no file at all.
+	cleaned := *profile
+	cleaned.Context = filepath.Clean(profile.Context)
+	profile = &cleaned
+
 	// Validate context exists
 	if _, err := os.Stat(profile.Context); errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("context directory doesn't exist: %s", profile.Context)
@@ -249,7 +257,7 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 				defer w.profilesMu.RUnlock()
 				for _, profile := range w.profiles {
 					rel, relErr := filepath.Rel(profile.Context, filePath)
-					if relErr != nil || strings.HasPrefix(rel, "..") {
+					if relErr != nil || escapesBase(rel) {
 						continue // filePath is not under this profile's context
 					}
 					patterns := w.getPatterns(profile.Context)
@@ -353,4 +361,11 @@ func (w *Watcher) findMatchingProfiles(filePath string) []string {
 func (w *Watcher) Close() error {
 	w.debouncer.StopAll()
 	return w.fsWatcher.Close()
+}
+
+// escapesBase reports whether rel, a path from filepath.Rel, points outside
+// its base directory. Testing for a ".." prefix alone would also match
+// legitimate names that merely start with two dots (e.g. "..env.local").
+func escapesBase(rel string) bool {
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }

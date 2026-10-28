@@ -25,13 +25,10 @@ func Push(profileName, filePath string) error {
 		return fmt.Errorf("cannot resolve path '%s': %w", filePath, err)
 	}
 
-	relPath := filepath.Base(filePath)
-	if rel, err := filepath.Rel(profile.Context, absFile); err == nil {
-		relPath = rel
-	}
-
-	// Check file is within context
-	if !strings.HasPrefix(absFile, profile.Context+"/") && absFile != profile.Context {
+	// Check file is within context. filepath.Rel cleans both paths, so a
+	// context configured with a trailing slash still matches.
+	relPath, relErr := filepath.Rel(profile.Context, absFile)
+	if relErr != nil || relPath == "." || escapesBase(relPath) {
 		notify.Error("SFTP Error", fmt.Sprintf("file '%s' is not within context '%s'", absFile, profile.Context))
 		return fmt.Errorf("file '%s' is not within context '%s'", absFile, profile.Context)
 	}
@@ -82,7 +79,7 @@ func Pull(profileName, filePath string) error {
 	absFile, _ := filepath.Abs(filePath)
 
 	rel, relErr := filepath.Rel(profile.Context, absFile)
-	if relErr == nil && !strings.HasPrefix(rel, "..") {
+	if relErr == nil && !escapesBase(rel) {
 		// Path is within the local context — use it directly.
 		relPath = rel
 	} else {
@@ -128,4 +125,11 @@ func Pull(profileName, filePath string) error {
 // Current uploads the current file (editor integration alias for Push)
 func Current(profileName, filePath string) error {
 	return Push(profileName, filePath)
+}
+
+// escapesBase reports whether rel, a path from filepath.Rel, points outside
+// its base directory. Testing for a ".." prefix alone would also match
+// legitimate names that merely start with two dots (e.g. "..env.local").
+func escapesBase(rel string) bool {
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }

@@ -70,63 +70,48 @@ func resolveProfile(profileName, contextFile string) (*config.Profile, error) {
 	return profile, nil
 }
 
+// direction describes one way of mirroring for runMirror's messages.
+type direction struct {
+	verb  string // "Upload"
+	doing string // "Uploading to"
+	done  string // "Uploaded to"
+	noun  string // "upload"
+	run   func(transfer.RemoteClient, *config.Profile, bool) (*transfer.MirrorResult, error)
+	moved func(*transfer.MirrorResult) int
+}
+
+var (
+	upload = direction{
+		verb: "Upload", doing: "Uploading to", done: "Uploaded to", noun: "upload",
+		run:   transfer.MirrorUp,
+		moved: func(r *transfer.MirrorResult) int { return r.Uploaded },
+	}
+	download = direction{
+		verb: "Download", doing: "Downloading from", done: "Downloaded from", noun: "download",
+		run:   transfer.MirrorDown,
+		moved: func(r *transfer.MirrorResult) int { return r.Downloaded },
+	}
+)
+
 // Up performs full upload sync
 func Up(profileName, contextFile string) error {
-	profile, err := resolveProfile(profileName, contextFile)
-	if err != nil {
-		return err
-	}
-
-	notify.Info("SFTP Sync", fmt.Sprintf("Uploading to %s...", profile.Host))
-
-	client := transfer.NewClient(profile)
-	if err := client.Connect(); err != nil {
-		notify.Error("SFTP Error", fmt.Sprintf("Failed to connect: %s", err.Error()))
-		return err
-	}
-	defer client.Close()
-
-	result, err := transfer.MirrorUp(client, profile, false)
-	if err != nil {
-		notify.Error("SFTP Error", err.Error())
-		return err
-	}
-
-	if result.Success {
-		total := result.Uploaded + result.Deleted + result.Created
-		if len(result.Warnings) > 0 {
-			for _, w := range result.Warnings {
-				fmt.Fprintf(os.Stderr, "  warning: %s\n", w)
-			}
-			notify.Warning("SFTP Sync Complete",
-				fmt.Sprintf("Uploaded to %s\n%s\n(%d warnings)", profile.Host, formatSummary(result), len(result.Warnings)))
-			fmt.Printf("⚠ Upload complete: %s (%d warnings)\n", formatSummary(result), len(result.Warnings))
-		} else {
-			notify.Success("SFTP Sync Complete", fmt.Sprintf("Uploaded to %s\n%s", profile.Host, formatSummary(result)))
-			fmt.Printf("✓ Upload complete: %s\n", formatSummary(result))
-		}
-		if total == 0 && result.Skipped > 0 {
-			fmt.Printf("  (all %d files already in sync)\n", result.Skipped)
-		}
-		return nil
-	}
-
-	for _, e := range result.Errors {
-		fmt.Fprintf(os.Stderr, "  error: %s\n", e)
-	}
-	notify.Error("SFTP Error", fmt.Sprintf("Upload failed with %d errors", len(result.Errors)))
-	fmt.Fprintf(os.Stderr, "✗ Upload failed!\n")
-	return fmt.Errorf("upload failed with %d errors", len(result.Errors))
+	return runMirror(profileName, contextFile, upload)
 }
 
 // Down performs full download sync
 func Down(profileName, contextFile string) error {
+	return runMirror(profileName, contextFile, download)
+}
+
+// runMirror connects, mirrors in direction d, and reports the outcome on
+// the terminal and as a desktop notification.
+func runMirror(profileName, contextFile string, d direction) error {
 	profile, err := resolveProfile(profileName, contextFile)
 	if err != nil {
 		return err
 	}
 
-	notify.Info("SFTP Sync", fmt.Sprintf("Downloading from %s...", profile.Host))
+	notify.Info("SFTP Sync", fmt.Sprintf("%s %s...", d.doing, profile.Host))
 
 	client := transfer.NewClient(profile)
 	if err := client.Connect(); err != nil {
@@ -135,24 +120,27 @@ func Down(profileName, contextFile string) error {
 	}
 	defer client.Close()
 
-	result, err := transfer.MirrorDown(client, profile, false)
+	result, err := d.run(client, profile, false)
 	if err != nil {
 		notify.Error("SFTP Error", err.Error())
 		return err
 	}
 
+	// Warnings (failed deletes, chmod, conflicts) are shown whether or not
+	// the sync succeeded overall — on failure they're often the context.
+	for _, w := range result.Warnings {
+		fmt.Fprintf(os.Stderr, "  warning: %s\n", w)
+	}
+
 	if result.Success {
-		total := result.Downloaded + result.Deleted + result.Created
+		total := d.moved(result) + result.Deleted + result.Created
 		if len(result.Warnings) > 0 {
-			for _, w := range result.Warnings {
-				fmt.Fprintf(os.Stderr, "  warning: %s\n", w)
-			}
 			notify.Warning("SFTP Sync Complete",
-				fmt.Sprintf("Downloaded from %s\n%s\n(%d warnings)", profile.Host, formatSummary(result), len(result.Warnings)))
-			fmt.Printf("⚠ Download complete: %s (%d warnings)\n", formatSummary(result), len(result.Warnings))
+				fmt.Sprintf("%s %s\n%s\n(%d warnings)", d.done, profile.Host, formatSummary(result), len(result.Warnings)))
+			fmt.Printf("⚠ %s complete: %s (%d warnings)\n", d.verb, formatSummary(result), len(result.Warnings))
 		} else {
-			notify.Success("SFTP Sync Complete", fmt.Sprintf("Downloaded from %s\n%s", profile.Host, formatSummary(result)))
-			fmt.Printf("✓ Download complete: %s\n", formatSummary(result))
+			notify.Success("SFTP Sync Complete", fmt.Sprintf("%s %s\n%s", d.done, profile.Host, formatSummary(result)))
+			fmt.Printf("✓ %s complete: %s\n", d.verb, formatSummary(result))
 		}
 		if total == 0 && result.Skipped > 0 {
 			fmt.Printf("  (all %d files already in sync)\n", result.Skipped)
@@ -163,9 +151,9 @@ func Down(profileName, contextFile string) error {
 	for _, e := range result.Errors {
 		fmt.Fprintf(os.Stderr, "  error: %s\n", e)
 	}
-	notify.Error("SFTP Error", fmt.Sprintf("Download failed with %d errors", len(result.Errors)))
-	fmt.Fprintf(os.Stderr, "✗ Download failed!\n")
-	return fmt.Errorf("download failed with %d errors", len(result.Errors))
+	notify.Error("SFTP Error", fmt.Sprintf("%s failed with %d errors", d.verb, len(result.Errors)))
+	fmt.Fprintf(os.Stderr, "✗ %s failed!\n", d.verb)
+	return fmt.Errorf("%s failed with %d errors", d.noun, len(result.Errors))
 }
 
 // Diff shows a dry-run preview of what would change.
