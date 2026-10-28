@@ -57,3 +57,37 @@ func TestWatcherSchedulesRemovedAndRenamedPaths(t *testing.T) {
 		}
 	}
 }
+
+// A context configured with a trailing slash must still match its files.
+func TestWatcherContextWithTrailingSlash(t *testing.T) {
+	ctx, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	got := make(chan string, 4)
+	profile := &config.Profile{Context: ctx + "/", AutoSyncDebounce: 20}
+	if err := w.Watch("p", profile, func(p string) { got <- p }); err != nil {
+		t.Fatal(err)
+	}
+	w.Start()
+
+	file := filepath.Join(ctx, "index.html")
+	os.WriteFile(file, []byte("x"), 0o644)
+	select {
+	case p := <-got:
+		if p != file {
+			t.Errorf("scheduled %q, want %q", p, file)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("file in a trailing-slash context was never scheduled")
+	}
+	if profile.Context != ctx+"/" {
+		t.Error("Watch modified the caller's profile")
+	}
+}
