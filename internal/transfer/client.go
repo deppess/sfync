@@ -24,6 +24,13 @@ type RemoteFileInfo struct {
 	ModTime time.Time
 	IsDir   bool
 	Mode    os.FileMode
+
+	// ModTimePrecision is how coarse ModTime is: 0 when exact (SFTP, FTP
+	// MLSD/MLST), otherwise the granularity the server's listing format
+	// allows (FTP LIST: a minute for recent files, a day for older ones).
+	// The reported time is truncated, so the true mtime lies in
+	// [ModTime, ModTime+ModTimePrecision).
+	ModTimePrecision time.Duration
 }
 
 // MirrorAction represents what to do with a file during mirror
