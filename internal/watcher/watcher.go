@@ -248,28 +248,8 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	}
 
 	if info.IsDir() {
-		// Directory created — watch it if at least one matching profile does not
-		// ignore it. Per-profile syncignore filtering happens at upload time, so
-		// we only skip watching when every matching profile explicitly ignores it.
 		if event.Op&fsnotify.Create == fsnotify.Create {
-			shouldWatch := func() bool {
-				w.profilesMu.RLock()
-				defer w.profilesMu.RUnlock()
-				for _, profile := range w.profiles {
-					rel, relErr := filepath.Rel(profile.Context, filePath)
-					if relErr != nil || escapesBase(rel) {
-						continue // filePath is not under this profile's context
-					}
-					patterns := w.getPatterns(profile.Context)
-					if !syncignore.ShouldIgnore(filepath.ToSlash(rel), patterns) {
-						return true
-					}
-				}
-				return false
-			}()
-			if shouldWatch {
-				w.fsWatcher.Add(filePath) //nolint:errcheck // best-effort
-			}
+			w.watchNewDir(filePath)
 		}
 		return
 	}
@@ -280,6 +260,61 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	}
 
 	w.schedule(filePath)
+}
+
+// watchNewDir starts watching a newly created directory and everything
+// already inside it.
+//
+// Directories and files can appear inside a new directory before the watch
+// on it exists — `mkdir -p a/b`, a git checkout or pull, unpacking an
+// archive, a build writing dist/js/... — and their creation events are
+// then never delivered. So the new tree is walked: every subdirectory is
+// watched, and every file found is scheduled (harmless if it was also seen
+// by an event: the debouncer and queue collapse duplicates, and the queue
+// applies .syncignore). Subtrees every matching profile ignores are
+// skipped, so ignored directories still cost no watches.
+func (w *Watcher) watchNewDir(dir string) {
+	filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // vanished meanwhile — nothing to watch
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			if !w.watchedByAnyProfile(p) {
+				return filepath.SkipDir
+			}
+			w.fsWatcher.Add(p) //nolint:errcheck // best-effort
+			return nil
+		}
+		if d.Type().IsRegular() {
+			w.schedule(p)
+		}
+		return nil
+	})
+}
+
+// watchedByAnyProfile reports whether dir is inside some profile's context
+// and not ignored by that profile's .syncignore. Per-profile filtering
+// happens again at upload time, so a directory is watched unless every
+// matching profile ignores it.
+func (w *Watcher) watchedByAnyProfile(dir string) bool {
+	w.profilesMu.RLock()
+	defer w.profilesMu.RUnlock()
+	for _, profile := range w.profiles {
+		rel, relErr := filepath.Rel(profile.Context, dir)
+		if relErr != nil || escapesBase(rel) {
+			continue // not under this profile's context
+		}
+		if !syncignore.ShouldIgnore(filepath.ToSlash(rel), w.getPatterns(profile.Context)) {
+			return true
+		}
+	}
+	return false
 }
 
 // schedule debounces a sync of filePath for every profile it belongs to.

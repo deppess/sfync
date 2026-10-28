@@ -91,3 +91,56 @@ func TestWatcherContextWithTrailingSlash(t *testing.T) {
 		t.Error("Watch modified the caller's profile")
 	}
 }
+
+// A directory tree created faster than the watcher can add watches
+// (mkdir -p, git checkout, unzip): files anywhere inside must be scheduled,
+// and ignored subtrees skipped.
+func TestWatcherFindsFilesInNewNestedDirs(t *testing.T) {
+	ctx, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(ctx, ".syncignore"), []byte("node_modules/\n"), 0o644)
+	w, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	got := make(chan string, 16)
+	if err := w.Watch("p", &config.Profile{Context: ctx, AutoSyncDebounce: 20}, func(p string) { got <- p }); err != nil {
+		t.Fatal(err)
+	}
+	w.Start()
+
+	deep := filepath.Join(ctx, "a", "b", "c", "d")
+	ignored := filepath.Join(ctx, "a", "node_modules", "pkg")
+	os.MkdirAll(deep, 0o755)
+	os.MkdirAll(ignored, 0o755)
+	os.WriteFile(filepath.Join(deep, "deep.js"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(ignored, "index.js"), []byte("x"), 0o644)
+
+	want := filepath.Join(deep, "deep.js")
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case p := <-got:
+			if filepath.Dir(p) == ignored {
+				t.Errorf("file in ignored subtree scheduled: %s", p)
+			}
+			if p == want {
+				// Give a stray ignored-file event a moment to show up.
+				time.Sleep(200 * time.Millisecond)
+				select {
+				case p := <-got:
+					if filepath.Dir(p) == ignored {
+						t.Errorf("file in ignored subtree scheduled: %s", p)
+					}
+				default:
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("file in a newly created nested directory was never scheduled")
+		}
+	}
+}
