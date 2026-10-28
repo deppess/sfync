@@ -23,6 +23,16 @@ func requireUnix(feature, reason string) {
 	}
 }
 
+// exitOnError ends a failed command: the error goes to stderr — even when
+// a desktop notification also reported it, since the terminal may be the
+// only place the user is looking — and the exit status is 1.
+func exitOnError(err error) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -42,9 +52,7 @@ func main() {
 		if len(os.Args) >= 4 {
 			contextFile = os.Args[3]
 		}
-		if err := cmd.Up(os.Args[2], contextFile); err != nil {
-			os.Exit(1)
-		}
+		exitOnError(cmd.Up(os.Args[2], contextFile))
 
 	case "down":
 		if len(os.Args) < 3 {
@@ -56,9 +64,7 @@ func main() {
 		if len(os.Args) >= 4 {
 			contextFile = os.Args[3]
 		}
-		if err := cmd.Down(os.Args[2], contextFile); err != nil {
-			os.Exit(1)
-		}
+		exitOnError(cmd.Down(os.Args[2], contextFile))
 
 	case "diff":
 		// Usage: sfync diff <up|down> <profile> [file]
@@ -74,36 +80,28 @@ func main() {
 		if len(os.Args) >= 5 {
 			contextFile = os.Args[4]
 		}
-		if err := cmd.Diff(direction, profileName, contextFile); err != nil {
-			os.Exit(1)
-		}
+		exitOnError(cmd.Diff(direction, profileName, contextFile))
 
 	case "push":
 		if len(os.Args) < 4 {
 			fmt.Println("Usage: sfync push <profile> <file>")
 			os.Exit(1)
 		}
-		if err := cmd.Push(os.Args[2], os.Args[3]); err != nil {
-			os.Exit(1)
-		}
+		exitOnError(cmd.Push(os.Args[2], os.Args[3]))
 
 	case "pull":
 		if len(os.Args) < 4 {
 			fmt.Println("Usage: sfync pull <profile> <file>")
 			os.Exit(1)
 		}
-		if err := cmd.Pull(os.Args[2], os.Args[3]); err != nil {
-			os.Exit(1)
-		}
+		exitOnError(cmd.Pull(os.Args[2], os.Args[3]))
 
 	case "current":
 		if len(os.Args) < 4 {
 			fmt.Println("Usage: sfync current <profile> <file>")
 			os.Exit(1)
 		}
-		if err := cmd.Current(os.Args[2], os.Args[3]); err != nil {
-			os.Exit(1)
-		}
+		exitOnError(cmd.Current(os.Args[2], os.Args[3]))
 
 	case "mount":
 		requireUnix("mount", "rclone (and sshfs on Linux)")
@@ -116,9 +114,7 @@ func main() {
 		if len(os.Args) >= 4 && os.Args[3] == "--yazi" {
 			openYazi = true
 		}
-		if err := cmd.Mount(profileName, openYazi); err != nil {
-			os.Exit(1)
-		}
+		exitOnError(cmd.Mount(profileName, openYazi))
 
 	case "unmount":
 		requireUnix("unmount", "rclone (and sshfs on Linux)")
@@ -127,55 +123,34 @@ func main() {
 			os.Exit(1)
 		}
 		if os.Args[2] == "--all" {
-			if err := cmd.Unmount("", true); err != nil {
-				os.Exit(1)
-			}
+			exitOnError(cmd.Unmount("", true))
 		} else {
-			if err := cmd.Unmount(os.Args[2], false); err != nil {
-				os.Exit(1)
-			}
+			exitOnError(cmd.Unmount(os.Args[2], false))
 		}
 
 	case "mounts":
 		requireUnix("mounts", "rclone (and sshfs on Linux)")
-		if err := cmd.Mounts(); err != nil {
-			os.Exit(1)
-		}
+		exitOnError(cmd.Mounts())
 
 	case "daemon":
 		requireUnix("daemon", "a desktop notifier (notify-send on Linux, osascript on macOS)")
-		if err := cmd.Daemon(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
+		exitOnError(cmd.Daemon())
 
 	case "install-daemon":
 		requireUnix("install-daemon", "a background service manager (systemd on Linux, launchd on macOS)")
-		if err := cmd.InstallDaemon(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
+		exitOnError(cmd.InstallDaemon())
 
 	case "uninstall-daemon":
 		requireUnix("uninstall-daemon", "a background service manager (systemd on Linux, launchd on macOS)")
-		if err := cmd.UninstallDaemon(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
+		exitOnError(cmd.UninstallDaemon())
 
 	case "on":
 		requireUnix("on", "a background service manager (systemd on Linux, launchd on macOS)")
-		if err := cmd.StartDaemon(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
+		exitOnError(cmd.StartDaemon())
 
 	case "off":
 		requireUnix("off", "a background service manager (systemd on Linux, launchd on macOS)")
-		if err := cmd.StopDaemon(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
+		exitOnError(cmd.StopDaemon())
 
 	case "version", "--version", "-v":
 		fmt.Printf("sfync version %s\n", version)
@@ -185,16 +160,10 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Usage: sfync --completions <fish|bash|zsh>")
 			os.Exit(1)
 		}
-		if err := cmd.Completions(os.Args[2]); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
+		exitOnError(cmd.Completions(os.Args[2]))
 
 	case "--list-profiles":
-		if err := cmd.ListProfiles(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
+		exitOnError(cmd.ListProfiles())
 
 	case "help", "--help", "-h":
 		printUsage()

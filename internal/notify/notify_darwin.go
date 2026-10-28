@@ -27,6 +27,9 @@ const notifierAppEmbedRoot = "darwinapp/sfync-notifier.app"
 // have one, which is why that approach is unreliable, especially from a
 // headless launchd context.
 func Send(title, message string, urgency Urgency) {
+	if disabled() {
+		return
+	}
 	if err := EnsureReady(); err != nil {
 		return
 	}
@@ -40,7 +43,11 @@ func Send(title, message string, urgency Urgency) {
 // EnsureReady extracts the bundled notifier app into ~/Library/Application
 // Support/sfync if it isn't already present. Cheap no-op on the common
 // path (just a stat), so it's safe to call before every notification.
+// With notifications disabled there is nothing to prepare.
 func EnsureReady() error {
+	if disabled() {
+		return nil
+	}
 	binPath, err := notifierBinaryPath()
 	if err != nil {
 		return err
