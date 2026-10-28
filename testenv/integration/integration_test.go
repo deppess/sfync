@@ -277,3 +277,36 @@ func TestFTPWithoutMLSDNoop(t *testing.T) {
 		}
 	}
 }
+
+// Uploads preserve permission bits on SFTP servers — chmod now runs
+// concurrently with closing the handle, so check it on each server kind.
+// (FTP has no standard permission model; skipped.)
+func TestUploadPreservesMode(t *testing.T) {
+	for _, k := range kinds {
+		if k.name == "ftp" {
+			continue
+		}
+		t.Run(k.name, func(t *testing.T) {
+			srv := k.start(t, netem.Local)
+			local := filepath.Join(t.TempDir(), "local")
+			os.Mkdir(local, 0o755)
+			modes := map[string]os.FileMode{"script.sh": 0o755, "private.txt": 0o600, "page.html": 0o644, "shared.txt": 0o664}
+			for name, mode := range modes {
+				p := filepath.Join(local, name)
+				os.WriteFile(p, []byte(name), 0o600)
+				os.Chmod(p, mode)
+			}
+			_, up := connect(t, srv, local)
+			up()
+			for name, want := range modes {
+				fi, err := os.Stat(filepath.Join(srv.Root, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := fi.Mode().Perm(); got != want {
+					t.Errorf("%s: remote mode %04o, want %04o", name, got, want)
+				}
+			}
+		})
+	}
+}
