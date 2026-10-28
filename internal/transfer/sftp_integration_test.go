@@ -4,11 +4,15 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"fmt"
+	"io"
+	"io/fs"
 	"net"
 	"net/textproto"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,6 +34,26 @@ func startSFTPServer(t *testing.T) *config.Profile {
 // startSFTPServerWithKey is startSFTPServer that also accepts public-key
 // auth for authorizedKey (when non-nil).
 func startSFTPServerWithKey(t *testing.T, authorizedKey ssh.PublicKey) *config.Profile {
+	t.Helper()
+	return startSFTPServerOpts(t, authorizedKey, nil)
+}
+
+// sessionLimiter counts concurrent session channels per server and can cap
+// them, like OpenSSH's MaxSessions.
+type sessionLimiter struct {
+	max                    int // 0 = unlimited
+	active, peak, rejected atomic.Int32
+}
+
+// startSFTPServerLimited starts a server allowing at most maxSessions
+// concurrent SFTP sessions (0 = unlimited), returning its session stats.
+func startSFTPServerLimited(t *testing.T, maxSessions int) (*config.Profile, *sessionLimiter) {
+	t.Helper()
+	lim := &sessionLimiter{max: maxSessions}
+	return startSFTPServerOpts(t, nil, lim), lim
+}
+
+func startSFTPServerOpts(t *testing.T, authorizedKey ssh.PublicKey, lim *sessionLimiter) *config.Profile {
 	t.Helper()
 
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -65,7 +89,7 @@ func startSFTPServerWithKey(t *testing.T, authorizedKey ssh.PublicKey) *config.P
 			if err != nil {
 				return
 			}
-			go serveSFTPConn(nConn, srvConfig)
+			go serveSFTPConn(nConn, srvConfig, lim)
 		}
 	}()
 
@@ -78,7 +102,7 @@ func startSFTPServerWithKey(t *testing.T, authorizedKey ssh.PublicKey) *config.P
 	}
 }
 
-func serveSFTPConn(nConn net.Conn, cfg *ssh.ServerConfig) {
+func serveSFTPConn(nConn net.Conn, cfg *ssh.ServerConfig, lim *sessionLimiter) {
 	_, chans, reqs, err := ssh.NewServerConn(nConn, cfg)
 	if err != nil {
 		return
@@ -89,11 +113,32 @@ func serveSFTPConn(nConn net.Conn, cfg *ssh.ServerConfig) {
 			newChan.Reject(ssh.UnknownChannelType, "unsupported")
 			continue
 		}
+		if lim != nil {
+			n := lim.active.Add(1)
+			if lim.max > 0 && int(n) > lim.max {
+				lim.active.Add(-1)
+				lim.rejected.Add(1)
+				newChan.Reject(ssh.ResourceShortage, "too many sessions")
+				continue
+			}
+			for {
+				p := lim.peak.Load()
+				if n <= p || lim.peak.CompareAndSwap(p, n) {
+					break
+				}
+			}
+		}
 		ch, chReqs, err := newChan.Accept()
 		if err != nil {
+			if lim != nil {
+				lim.active.Add(-1)
+			}
 			continue
 		}
 		go func() {
+			if lim != nil {
+				defer lim.active.Add(-1)
+			}
 			for req := range chReqs {
 				ok := req.Type == "subsystem" && string(req.Payload[4:]) == "sftp"
 				req.Reply(ok, nil)
@@ -315,5 +360,98 @@ func TestSFTPMirrorUpEndToEnd(t *testing.T) {
 	}
 	if len(again.Actions) != 0 {
 		t.Errorf("second run not in sync: %+v", again.Actions)
+	}
+}
+
+// writeTree creates n files of size bytes under dir.
+func writeTree(t *testing.T, dir string, n, size int) {
+	t.Helper()
+	data := make([]byte, size)
+	for i := range n {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%02d.bin", i)), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// Parallel transfers each get their own SFTP session (SSH channel), within
+// MaxConcurrentTransfers plus the primary session.
+func TestSFTPTransfersUseSeparateSessions(t *testing.T) {
+	profile, lim := startSFTPServerLimited(t, 0)
+	c := connectTestClient(t, profile)
+	local, remote := t.TempDir(), t.TempDir()
+	writeTree(t, local, 12, 4<<20)
+
+	profile.Context, profile.RemotePath = local, remote
+	res, err := MirrorUp(c, profile, false)
+	if err != nil || !res.Success {
+		t.Fatalf("mirror up: %v %v", err, res.Errors)
+	}
+	if res.Uploaded != 12 {
+		t.Errorf("uploaded %d, want 12", res.Uploaded)
+	}
+	if p := int(lim.peak.Load()); p < 2 || p > 1+MaxConcurrentTransfers {
+		t.Errorf("peak sessions = %d, want 2..%d", p, 1+MaxConcurrentTransfers)
+	}
+}
+
+// A server allowing only the primary session (MaxSessions 1) still works:
+// transfers fall back to sharing it.
+func TestSFTPTransfersFallBackWhenSessionsLimited(t *testing.T) {
+	for _, max := range []int{1, 2} {
+		t.Run(fmt.Sprintf("maxSessions=%d", max), func(t *testing.T) {
+			profile, lim := startSFTPServerLimited(t, max)
+			c := connectTestClient(t, profile)
+			local, remote := t.TempDir(), t.TempDir()
+			writeTree(t, local, 8, 1<<20)
+
+			profile.Context, profile.RemotePath = local, remote
+			res, err := MirrorUp(c, profile, false)
+			if err != nil || !res.Success {
+				t.Fatalf("mirror up: %v %v", err, res.Errors)
+			}
+			if res.Uploaded != 8 {
+				t.Errorf("uploaded %d, want 8", res.Uploaded)
+			}
+			if p := int(lim.peak.Load()); p > max {
+				t.Errorf("peak sessions %d exceeded the server's limit %d", p, max)
+			}
+		})
+	}
+}
+
+func TestSFTPPacketSize(t *testing.T) {
+	cases := map[string]int{
+		"SSH-2.0-OpenSSH_9.6":             openSSHPacketSize,
+		"SSH-2.0-OpenSSH_for_Windows_9.5": openSSHPacketSize,
+		"SSH-2.0-Go":                      defaultSFTPPacketSize,
+		"SSH-2.0-AWS_SFTP_1.1":            defaultSFTPPacketSize,
+		"SSH-2.0-ProFTPD":                 defaultSFTPPacketSize,
+		"":                                defaultSFTPPacketSize,
+	}
+	for banner, want := range cases {
+		if got := sftpPacketSize([]byte(banner)); got != want {
+			t.Errorf("sftpPacketSize(%q) = %d, want %d", banner, got, want)
+		}
+	}
+}
+
+func TestSFTPSessionBroken(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"not exist", &fs.PathError{Op: "open", Path: "/x", Err: fs.ErrNotExist}, false},
+		{"permission", wrapError("upload", fs.ErrPermission), false},
+		{"status error", wrapError("upload", &sftp.StatusError{Code: 4}), false},
+		{"connection lost", wrapError("upload", io.ErrUnexpectedEOF), true},
+		{"channel closed", errors.New("sftp: channel closed"), true},
+	}
+	for _, tc := range cases {
+		if got := sftpSessionBroken(tc.err); got != tc.want {
+			t.Errorf("%s: sftpSessionBroken = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

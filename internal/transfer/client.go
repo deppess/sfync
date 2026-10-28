@@ -115,10 +115,12 @@ const (
 	MaxConcurrentReadDir = 32
 
 	// MaxConcurrentTransfers bounds how many file uploads/downloads run in
-	// parallel over one SFTP connection (see runTransfers in mirror.go).
-	// Kept smaller than MaxConcurrentReadDir since transfers are bandwidth-
-	// bound, not just latency-bound — over-parallelizing large files buys
-	// nothing and just contends for the same link.
+	// parallel (see runTransfers in mirror.go) — over SFTP each on its own
+	// session (SSH channel) of the one connection, over FTP each on its own
+	// pooled connection (up to ftpConnections). Kept smaller than
+	// MaxConcurrentReadDir since transfers are bandwidth-bound, not just
+	// latency-bound — over-parallelizing large files buys nothing and just
+	// contends for the same link.
 	MaxConcurrentTransfers = 4
 )
 
