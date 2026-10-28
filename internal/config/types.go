@@ -111,6 +111,11 @@ func (p *Profile) SetDefaults() {
 	}
 	p.SSHKey = ExpandHome(p.SSHKey)
 	p.Context = ExpandHome(p.Context)
+	if p.Context != "" {
+		// Canonical form ("/a/b", never "/a/b/" or "/a/./b"): code across
+		// sfync compares context paths against cleaned file paths.
+		p.Context = filepath.Clean(p.Context)
+	}
 	p.TLSCACert = ExpandHome(p.TLSCACert)
 }
 

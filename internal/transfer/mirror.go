@@ -659,10 +659,11 @@ type reconnectCoordinator struct {
 // runGuarded runs fn (a single transfer attempt) holding a read lock, and
 // returns the generation observed at the time — pass that to reconnect if
 // fn fails.
-func (rc *reconnectCoordinator) runGuarded(fn func() error) (error, int) {
+func (rc *reconnectCoordinator) runGuarded(fn func() error) (gen int, err error) {
 	rc.rw.RLock()
 	defer rc.rw.RUnlock()
-	return fn(), rc.gen
+	err = fn()
+	return rc.gen, err
 }
 
 // healthy reports whether a failure observed at observedGen happened on a
@@ -721,13 +722,13 @@ func runTransfers(client RemoteClient, jobs []transferJob, onResult func(action 
 	for w := 0; w < workers; w++ {
 		wg.Go(func() {
 			for job := range jobsCh {
-				err, gen := rc.runGuarded(job.run)
+				gen, err := rc.runGuarded(job.run)
 				if err != nil && !rc.healthy(client, gen) {
 					// Connection died (or was already replaced by another
 					// worker): reconnect if still needed, then retry once
 					fmt.Fprintf(os.Stderr, "  retry: %s\n", job.action.RelPath)
 					if rerr := rc.reconnect(client, gen); rerr == nil {
-						err, _ = rc.runGuarded(job.run)
+						_, err = rc.runGuarded(job.run)
 					}
 				}
 
