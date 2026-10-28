@@ -1,6 +1,7 @@
 package transfer
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
@@ -470,5 +471,65 @@ func TestSFTPSmallFilesSharePrimarySession(t *testing.T) {
 	}
 	if p := lim.peak.Load(); p != 1 {
 		t.Errorf("peak sessions = %d, want 1 (small files share the primary)", p)
+	}
+}
+
+// DownloadKnown's single-READ path for small files, including files that
+// changed size between listing and download.
+func TestSFTPDownloadKnownSmallFiles(t *testing.T) {
+	c := connectTestClient(t, startSFTPServer(t))
+	remoteDir, localDir := t.TempDir(), t.TempDir()
+	mtime := time.Date(2025, 3, 4, 5, 6, 7, 0, time.UTC)
+
+	get := func(t *testing.T, name string, listedSize int64) []byte {
+		t.Helper()
+		dst := filepath.Join(localDir, name)
+		if err := c.DownloadKnown(filepath.Join(remoteDir, name), dst, listedSize, mtime); err != nil {
+			t.Fatalf("download: %v", err)
+		}
+		fi, _ := os.Stat(dst)
+		if !fi.ModTime().Equal(mtime) {
+			t.Errorf("mtime = %v, want listed %v", fi.ModTime(), mtime)
+		}
+		got, _ := os.ReadFile(dst)
+		return got
+	}
+
+	os.WriteFile(filepath.Join(remoteDir, "same.txt"), []byte("hello world"), 0o644)
+	if got := get(t, "same.txt", 11); string(got) != "hello world" {
+		t.Errorf("unchanged: got %q", got)
+	}
+
+	os.WriteFile(filepath.Join(remoteDir, "empty.txt"), nil, 0o644)
+	if got := get(t, "empty.txt", 0); len(got) != 0 {
+		t.Errorf("empty: got %d bytes", len(got))
+	}
+
+	// Shrank after listing: listed 100 bytes, now 5 — must get the 5.
+	os.WriteFile(filepath.Join(remoteDir, "shrank.txt"), []byte("short"), 0o644)
+	if got := get(t, "shrank.txt", 100); string(got) != "short" {
+		t.Errorf("shrank: got %q", got)
+	}
+
+	// Grew after listing: a snapshot of the listed size is acceptable, but
+	// the next sync must see it as out of date (size differs).
+	os.WriteFile(filepath.Join(remoteDir, "grew.txt"), []byte("0123456789"), 0o644)
+	got := get(t, "grew.txt", 4)
+	local, _ := os.Stat(filepath.Join(localDir, "grew.txt"))
+	if !isDifferent(local, &RemoteFileInfo{Size: 10, ModTime: mtime}) {
+		t.Errorf("grown file (%q) would be considered in sync", got)
+	}
+
+	// Just over the packet size takes the generic streaming path.
+	big := make([]byte, defaultSFTPPacketSize+1)
+	for i := range big {
+		big[i] = byte(i)
+	}
+	os.WriteFile(filepath.Join(remoteDir, "big.bin"), big, 0o644)
+	if got := get(t, "big.bin", int64(len(big))); !bytes.Equal(got, big) {
+		t.Errorf("big file corrupted (%d bytes)", len(got))
+	}
+	if names := listDir(t, localDir); len(names) != 5 {
+		t.Errorf("unexpected local files (temp leftovers?): %v", names)
 	}
 }

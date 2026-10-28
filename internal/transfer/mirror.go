@@ -613,7 +613,14 @@ func executeDown(client RemoteClient, profile *config.Profile, actions []MirrorE
 		localPath := filepath.Join(profile.Context, action.RelPath)
 		jobs[i] = transferJob{
 			action: action,
-			run:    func() error { return client.Download(rPath, localPath) },
+			run: func() error {
+				// The scan already knows size and mtime: let clients that
+				// can use them skip looking them up again (a round trip).
+				if kd, ok := client.(knownDownloader); ok && action.RemoteInfo != nil {
+					return kd.DownloadKnown(rPath, localPath, action.RemoteInfo.Size, action.RemoteInfo.ModTime)
+				}
+				return client.Download(rPath, localPath)
+			},
 		}
 	}
 
@@ -625,6 +632,13 @@ func executeDown(client RemoteClient, profile *config.Profile, actions []MirrorE
 			result.Downloaded++
 		}
 	})
+}
+
+// knownDownloader is implemented by clients that can download a file whose
+// size and mtime the caller already knows — saving the round trip(s) to
+// look them up. Both sftpClient and ftpClient implement it.
+type knownDownloader interface {
+	DownloadKnown(remotePath, localPath string, size int64, mtime time.Time) error
 }
 
 // transferJob is one queued upload or download.

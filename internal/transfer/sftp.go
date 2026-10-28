@@ -1,6 +1,7 @@
 package transfer
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -10,7 +11,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -373,29 +376,45 @@ func (c *sftpClient) uploadOn(sess *sftp.Client, op string, local *os.File, loca
 		}
 	}
 
-	// Stream copy. Close errors matter here: with concurrent writes enabled,
-	// a write failure can surface only when the handle is closed.
+	// Stream copy. Writes are pipelined; io.Copy returns once all are
+	// acknowledged.
 	var n int64
 	if err == nil {
 		n, err = io.Copy(remote, local)
 	}
-	if cerr := remote.Close(); err == nil {
-		err = cerr
-	}
 	if err != nil {
+		remote.Close()
 		if !resume {
 			c.removeQuiet(sess, partial)
 		}
 		return wrapError(op, err)
 	}
 
-	// Preserve permissions (non-fatal)
-	if chmodErr := sess.Chmod(partial, localInfo.Mode()); chmodErr != nil {
+	// Close the handle and preserve permissions and mtime (so the next diff
+	// sees the file as in sync) concurrently: with every write acknowledged
+	// the three are independent — closing doesn't change mode or mtime, and
+	// chmod/utimes on a path don't care that a handle is open — so one
+	// round trip instead of three. The rename below must wait for all of
+	// them: it changes the path the other two use.
+	var closeErr, chmodErr, chtErr error
+	var wg sync.WaitGroup
+	wg.Go(func() { closeErr = remote.Close() })
+	wg.Go(func() { chmodErr = sess.Chmod(partial, localInfo.Mode()) })
+	wg.Go(func() { chtErr = sess.Chtimes(partial, localInfo.ModTime(), localInfo.ModTime()) })
+	wg.Wait()
+
+	// A close error is fatal: with pipelined writes, a write failure can
+	// surface only when the handle is closed.
+	if closeErr != nil {
+		if !resume {
+			c.removeQuiet(sess, partial)
+		}
+		return wrapError(op, closeErr)
+	}
+	if chmodErr != nil {
 		fmt.Fprintf(os.Stderr, "  warning: chmod failed for %s: %v\n", remotePath, chmodErr)
 	}
-
-	// Preserve mtime so next diff sees files as in sync
-	if chtErr := sess.Chtimes(partial, localInfo.ModTime(), localInfo.ModTime()); chtErr != nil {
+	if chtErr != nil {
 		fmt.Fprintf(os.Stderr, "  warning: chtimes failed for %s: %v\n", remotePath, chtErr)
 	}
 
@@ -438,39 +457,65 @@ func (c *sftpClient) removeQuiet(sess *sftp.Client, remotePath string) {
 // Download retrieves a remote file to a local path. The local file is only
 // replaced once the download has fully succeeded (see writeLocalAtomic).
 func (c *sftpClient) Download(remotePath, localPath string) error {
-	// Ensure local directory exists
-	localDir := filepath.Dir(localPath)
-	if err := os.MkdirAll(localDir, 0755); err != nil {
-		return wrapError("download", err)
-	}
-
-	// Stat remote for size (which picks the session) and deadline
+	// Stat remote for size (which picks the session and deadline) and mtime
 	endOp := c.deadlines.begin(OperationTimeout)
 	remoteInfo, err := c.sftpClient.Stat(remotePath)
 	endOp()
 	if err != nil {
 		return wrapError("download", err)
 	}
+	return c.DownloadKnown(remotePath, localPath, remoteInfo.Size(), remoteInfo.ModTime())
+}
 
-	sess, release := c.transferSession(remoteInfo.Size())
-	err = c.downloadOn(sess, remotePath, localPath, remoteInfo)
+// DownloadKnown is Download for a file whose size and mtime the caller
+// already knows (e.g. from the mirror's remote scan), saving the stat round
+// trip. See knownDownloader in mirror.go.
+func (c *sftpClient) DownloadKnown(remotePath, localPath string, size int64, mtime time.Time) error {
+	// Ensure local directory exists
+	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+		return wrapError("download", err)
+	}
+
+	sess, release := c.transferSession(size)
+	err := c.downloadOn(sess, remotePath, localPath, size, mtime)
 	release(err)
 	return err
 }
 
-// downloadOn performs Download's transfer on one SFTP session.
-func (c *sftpClient) downloadOn(sess *sftp.Client, remotePath, localPath string, remoteInfo os.FileInfo) error {
-	defer c.deadlines.begin(TransferTimeout(remoteInfo.Size()))()
+// downloadOn performs a download on one SFTP session.
+func (c *sftpClient) downloadOn(sess *sftp.Client, remotePath, localPath string, size int64, mtime time.Time) error {
+	defer c.deadlines.begin(TransferTimeout(size))()
 
 	// Open remote
 	remote, err := sess.Open(remotePath)
 	if err != nil {
 		return wrapError("download", err)
 	}
-	defer remote.Close()
+
+	var src io.Reader = remote
+	if size <= int64(c.packetSize) {
+		// Small file: one READ of exactly the known size, instead of the
+		// generic path's FSTAT (pkg/sftp sizing its reads) plus reads up to
+		// an EOF reply. If the file shrank since it was listed, the read
+		// comes back short (io.EOF) and we keep what's there; if it grew or
+		// changed, we store this snapshot stamped with the listed mtime,
+		// which the next sync sees as out of date and fetches again.
+		buf := make([]byte, size)
+		n, rerr := remote.ReadAt(buf, 0)
+		if rerr != nil && !errors.Is(rerr, io.EOF) {
+			remote.Close()
+			return wrapError("download", rerr)
+		}
+		src = bytes.NewReader(buf[:n])
+		// Closing a read-only handle can't affect the data already read, so
+		// don't spend a round trip waiting for the reply.
+		go remote.Close()
+	} else {
+		defer remote.Close()
+	}
 
 	// Stream to a temp file and rename into place, preserving remote mtime
-	n, err := writeLocalAtomic(localPath, remote, nil, remoteInfo.ModTime())
+	n, err := writeLocalAtomic(localPath, src, nil, mtime)
 	if err != nil {
 		return wrapError("download", err)
 	}
