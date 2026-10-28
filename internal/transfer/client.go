@@ -114,14 +114,24 @@ const (
 	// stays far below OpenSSH's limit (its open-file limit, typically 1024).
 	MaxConcurrentReadDir = 32
 
-	// MaxConcurrentTransfers bounds how many file uploads/downloads run in
-	// parallel (see runTransfers in mirror.go) — over SFTP each on its own
-	// session (SSH channel) of the one connection, over FTP each on its own
-	// pooled connection (up to ftpConnections). Kept smaller than
-	// MaxConcurrentReadDir since transfers are bandwidth-bound, not just
-	// latency-bound — over-parallelizing large files buys nothing and just
-	// contends for the same link.
-	MaxConcurrentTransfers = 4
+	// MaxConcurrentTransfers bounds how many file uploads/downloads (and
+	// mkdir/delete operations) runTransfers runs in parallel when the client
+	// supports it (see mirror.go). Small files are latency-bound — each
+	// costs several dependent round trips (open, write, close, chmod, mtime,
+	// rename) but little bandwidth — so many in flight hides latency. Over
+	// FTP the real limit is ftpConnections; extra workers wait for a free
+	// connection.
+	MaxConcurrentTransfers = 16
+
+	// MaxConcurrentLargeTransfers bounds how many files of at least
+	// LargeTransferSize transfer at once. Large files are bandwidth-bound:
+	// more of them in parallel just contend for the same link. Over SFTP
+	// each gets its own session (SSH channel) for its own flow-control
+	// window; small files share the primary session.
+	MaxConcurrentLargeTransfers = 4
+
+	// LargeTransferSize is the size from which a transfer counts as large.
+	LargeTransferSize = 1 << 20
 )
 
 // TransferTimeout calculates a timeout proportional to file size.
