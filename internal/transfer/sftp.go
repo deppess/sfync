@@ -29,7 +29,8 @@ type sftpClient struct {
 	// xfer holds extra SFTP sessions (channels on the same SSH connection)
 	// that file transfers check out one each — see transferSession.
 	xfer         *connPool[*sftp.Client]
-	xferDisabled atomic.Bool // server allows no extra session; use primary
+	xferDisabled atomic.Bool   // server allows no extra session; use primary
+	largeSlots   chan struct{} // bounds concurrent large transfers
 	packetSize   int
 }
 
@@ -122,7 +123,8 @@ func (c *sftpClient) Connect() error {
 	c.sftpClient = sftpConn
 
 	c.xferDisabled.Store(false)
-	c.xfer = newConnPool(MaxConcurrentTransfers,
+	c.largeSlots = make(chan struct{}, MaxConcurrentLargeTransfers)
+	c.xfer = newConnPool(MaxConcurrentLargeTransfers,
 		func() (*sftp.Client, error) { return sftp.NewClient(c.sshClient, c.sftpOptions()...) },
 		func(s *sftp.Client) { s.Close() },
 		func(limit int) {
@@ -167,29 +169,40 @@ func (c *sftpClient) sftpOptions() []sftp.ClientOption {
 	return []sftp.ClientOption{packet, sftp.UseConcurrentReads(true), sftp.UseConcurrentWrites(true)}
 }
 
-// transferSession returns an SFTP session for one file transfer and a
-// release function to call with the transfer's result.
+// transferSession returns an SFTP session for transferring a file of the
+// given size, and a release function to call with the transfer's result.
 //
-// Each concurrent transfer gets its own session — its own SSH channel on
-// the same connection. An SSH channel carries at most its flow-control
-// window (~2 MB in x/crypto/ssh) in flight, so on a fast, high-latency link
-// a single shared session caps all parallel transfers together at roughly
-// window/RTT (≈50 MB/s at 40ms); separate channels each get their own
-// window. Extra sessions open lazily and are reused. Servers limit channels
-// per connection (OpenSSH MaxSessions, default 10): if one can't be opened
-// the pool stops growing, and if none can, transfers share the primary
-// session, as before.
-func (c *sftpClient) transferSession() (*sftp.Client, func(error)) {
+// Small files share the primary session: they're latency-bound, and many
+// can be in flight on one channel. Large files (≥ LargeTransferSize) are
+// limited to MaxConcurrentLargeTransfers at once, each on its own session —
+// its own SSH channel on the same connection. An SSH channel carries at
+// most its flow-control window (~2 MB in x/crypto/ssh) in flight, so on a
+// fast, high-latency link a single shared session caps all parallel large
+// transfers together at roughly window/RTT (≈50 MB/s at 40ms); separate
+// channels each get their own window. Extra sessions open lazily and are
+// reused. Servers limit channels per connection (OpenSSH MaxSessions,
+// default 10): if one can't be opened the pool stops growing, and if none
+// can, large transfers share the primary session too.
+func (c *sftpClient) transferSession(size int64) (*sftp.Client, func(error)) {
+	if size < LargeTransferSize || c.largeSlots == nil {
+		return c.sftpClient, func(error) {}
+	}
+	c.largeSlots <- struct{}{}
+	freeSlot := func() { <-c.largeSlots }
+
 	if c.xfer != nil && !c.xferDisabled.Load() {
 		s, err := c.xfer.acquire()
 		if err == nil {
-			return s, func(err error) { c.xfer.release(s, sftpSessionBroken(err)) }
+			return s, func(err error) {
+				c.xfer.release(s, sftpSessionBroken(err))
+				freeSlot()
+			}
 		}
 		if !errors.Is(err, errPoolClosed) && c.xferDisabled.CompareAndSwap(false, true) {
 			fmt.Fprintf(os.Stderr, "  note: %s allows no extra SFTP sessions; transfers share one\n", c.profile.Host)
 		}
 	}
-	return c.sftpClient, func(error) {}
+	return c.sftpClient, func(error) { freeSlot() }
 }
 
 // sftpSessionBroken reports whether an SFTP session must be discarded after
@@ -320,7 +333,7 @@ func (c *sftpClient) upload(localPath, remotePath string, resume bool) error {
 		return wrapError(op, err)
 	}
 
-	sess, release := c.transferSession()
+	sess, release := c.transferSession(localInfo.Size())
 	err = c.uploadOn(sess, op, local, localInfo, remotePath, resume)
 	release(err)
 	return err
@@ -431,22 +444,22 @@ func (c *sftpClient) Download(remotePath, localPath string) error {
 		return wrapError("download", err)
 	}
 
-	sess, release := c.transferSession()
-	err := c.downloadOn(sess, remotePath, localPath)
-	release(err)
-	return err
-}
-
-// downloadOn performs Download's transfer on one SFTP session.
-func (c *sftpClient) downloadOn(sess *sftp.Client, remotePath, localPath string) error {
-	// Stat remote for size and deadline
+	// Stat remote for size (which picks the session) and deadline
 	endOp := c.deadlines.begin(OperationTimeout)
-	remoteInfo, err := sess.Stat(remotePath)
+	remoteInfo, err := c.sftpClient.Stat(remotePath)
 	endOp()
 	if err != nil {
 		return wrapError("download", err)
 	}
 
+	sess, release := c.transferSession(remoteInfo.Size())
+	err = c.downloadOn(sess, remotePath, localPath, remoteInfo)
+	release(err)
+	return err
+}
+
+// downloadOn performs Download's transfer on one SFTP session.
+func (c *sftpClient) downloadOn(sess *sftp.Client, remotePath, localPath string, remoteInfo os.FileInfo) error {
 	defer c.deadlines.begin(TransferTimeout(remoteInfo.Size()))()
 
 	// Open remote

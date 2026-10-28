@@ -375,7 +375,7 @@ func writeTree(t *testing.T, dir string, n, size int) {
 }
 
 // Parallel transfers each get their own SFTP session (SSH channel), within
-// MaxConcurrentTransfers plus the primary session.
+// MaxConcurrentLargeTransfers plus the primary session.
 func TestSFTPTransfersUseSeparateSessions(t *testing.T) {
 	profile, lim := startSFTPServerLimited(t, 0)
 	c := connectTestClient(t, profile)
@@ -390,8 +390,8 @@ func TestSFTPTransfersUseSeparateSessions(t *testing.T) {
 	if res.Uploaded != 12 {
 		t.Errorf("uploaded %d, want 12", res.Uploaded)
 	}
-	if p := int(lim.peak.Load()); p < 2 || p > 1+MaxConcurrentTransfers {
-		t.Errorf("peak sessions = %d, want 2..%d", p, 1+MaxConcurrentTransfers)
+	if p := int(lim.peak.Load()); p < 2 || p > 1+MaxConcurrentLargeTransfers {
+		t.Errorf("peak sessions = %d, want 2..%d", p, 1+MaxConcurrentLargeTransfers)
 	}
 }
 
@@ -453,5 +453,22 @@ func TestSFTPSessionBroken(t *testing.T) {
 		if got := sftpSessionBroken(tc.err); got != tc.want {
 			t.Errorf("%s: sftpSessionBroken = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// Small files all share the primary session — no extra channels opened.
+func TestSFTPSmallFilesSharePrimarySession(t *testing.T) {
+	profile, lim := startSFTPServerLimited(t, 0)
+	c := connectTestClient(t, profile)
+	local, remote := t.TempDir(), t.TempDir()
+	writeTree(t, local, 40, 4<<10)
+
+	profile.Context, profile.RemotePath = local, remote
+	res, err := MirrorUp(c, profile, false)
+	if err != nil || !res.Success || res.Uploaded != 40 {
+		t.Fatalf("mirror up: %v %v uploaded=%d", err, res.Errors, res.Uploaded)
+	}
+	if p := lim.peak.Load(); p != 1 {
+		t.Errorf("peak sessions = %d, want 1 (small files share the primary)", p)
 	}
 }
