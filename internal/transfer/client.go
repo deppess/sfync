@@ -103,8 +103,12 @@ const (
 
 	// MaxConcurrentReadDir bounds how many ReadDir calls walkRemote issues in
 	// parallel when the underlying client supports concurrent requests (SFTP
-	// only — see walkRemote in mirror.go).
-	MaxConcurrentReadDir = 8
+	// only — see walkRemote in mirror.go). Each SFTP listing is ≥4 dependent
+	// round trips (open, read, read-to-EOF, close), so on a latency-bound
+	// link the scan is round-trip-bound and parallelism is the lever.
+	// Each in-flight listing holds one server-side directory handle; 32
+	// stays far below OpenSSH's limit (its open-file limit, typically 1024).
+	MaxConcurrentReadDir = 32
 
 	// MaxConcurrentTransfers bounds how many file uploads/downloads run in
 	// parallel over one SFTP connection (see runTransfers in mirror.go).
