@@ -46,10 +46,14 @@ var (
 	LAN   = Profile{Name: "lan", RTT: 1 * time.Millisecond, Bandwidth: Mbps(1000)}  // wired LAN
 	WAN   = Profile{Name: "wan", RTT: 40 * time.Millisecond, Bandwidth: Mbps(100)}  // typical remote host
 	Slow  = Profile{Name: "slow", RTT: 120 * time.Millisecond, Bandwidth: Mbps(10)} // distant / constrained
+	// FatPipe is a fast link with real latency (fiber, datacenter to
+	// datacenter): a large bandwidth-delay product (5 MB), where in-flight
+	// data limits — not bandwidth — decide throughput.
+	FatPipe = Profile{Name: "fatpipe", RTT: 40 * time.Millisecond, Bandwidth: Mbps(1000)}
 )
 
 // Presets lists the predefined profiles by name.
-var Presets = map[string]Profile{"local": Local, "lan": LAN, "wan": WAN, "slow": Slow}
+var Presets = map[string]Profile{"local": Local, "lan": LAN, "wan": WAN, "slow": Slow, "fatpipe": FatPipe}
 
 const chunkSize = 32 * 1024
 

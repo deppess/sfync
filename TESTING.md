@@ -41,6 +41,7 @@ make bench SERVERS=openssh NETS=wan FIXTURES=website BENCH=UpNoop
 | `lan` | 1 ms | 1 Gbit/s |
 | `wan` | 40 ms | 100 Mbit/s |
 | `slow` | 120 ms | 10 Mbit/s (opt-in: slow to run) |
+| `fatpipe` | 40 ms | 1 Gbit/s (opt-in): a fast link with real latency, where in-flight data limits throughput more than bandwidth does |
 
 Results report time per operation, MB/s and files/s. The workflow for an optimization is:
 
