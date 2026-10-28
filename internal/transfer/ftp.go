@@ -353,6 +353,19 @@ func warnNoSetTime(host string) {
 // Download retrieves a remote file to a local path. The local file is only
 // replaced once the download has fully succeeded (see writeLocalAtomic).
 func (c *ftpClient) Download(remotePath, localPath string) error {
+	return c.download(remotePath, localPath, nil)
+}
+
+// DownloadKnown is Download for a file whose size and mtime the caller
+// already knows (e.g. from the mirror's remote scan), skipping the metadata
+// lookup. See knownDownloader in mirror.go.
+func (c *ftpClient) DownloadKnown(remotePath, localPath string, size int64, mtime time.Time) error {
+	return c.download(remotePath, localPath, &RemoteFileInfo{Size: size, ModTime: mtime})
+}
+
+// download retrieves remotePath; known, if non-nil, supplies size and mtime
+// (already timezone-corrected) so they needn't be looked up.
+func (c *ftpClient) download(remotePath, localPath string, known *RemoteFileInfo) error {
 	// Ensure local directory exists
 	localDir := filepath.Dir(localPath)
 	if err := os.MkdirAll(localDir, 0755); err != nil {
@@ -360,17 +373,23 @@ func (c *ftpClient) Download(remotePath, localPath string) error {
 	}
 
 	return c.withConn("download", OperationTimeout, func(conn *ftpSession) error {
-		// Stat remote for mtime (corrected for the server's LIST timezone)
-		// and size, which sets the transfer's time budget.
+		// Size sets the transfer's time budget; mtime is preserved locally.
 		var mtime time.Time
-		if entry, statErr := conn.GetEntry(remotePath); statErr == nil {
-			c.detectListOffset(conn, remotePath, entry)
-			mtime = c.toRemote(conn, entry).ModTime
-			conn.begin(TransferTimeout(int64(entry.Size)))
-		} else if size, sizeErr := conn.FileSize(remotePath); sizeErr == nil {
-			conn.begin(TransferTimeout(size))
-		} else {
-			conn.begin(unknownSizeTransferTimeout)
+		switch {
+		case known != nil:
+			mtime = known.ModTime
+			conn.begin(TransferTimeout(known.Size))
+		default:
+			// Look both up (mtime corrected for the server's LIST timezone).
+			if entry, statErr := conn.GetEntry(remotePath); statErr == nil {
+				c.detectListOffset(conn, remotePath, entry)
+				mtime = c.toRemote(conn, entry).ModTime
+				conn.begin(TransferTimeout(int64(entry.Size)))
+			} else if size, sizeErr := conn.FileSize(remotePath); sizeErr == nil {
+				conn.begin(TransferTimeout(size))
+			} else {
+				conn.begin(unknownSizeTransferTimeout)
+			}
 		}
 
 		// FTP Retr
