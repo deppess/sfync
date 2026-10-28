@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -123,7 +122,12 @@ func closeWrite(c net.Conn) {
 }
 
 // Pipe shapes traffic between a and b in both directions until both
-// directions finish, then closes both.
+// directions finish, then closes both — always gracefully: each side gets
+// a FIN once the other has finished sending, so a peer that half-closed and
+// is still reading receives every byte before EOF. (Resetting connections
+// to dodge TIME_WAIT would be faster to recycle but can discard unread
+// data; ephemeral-port pressure is instead handled by pacing in the
+// benchmarks — see bench.drainSockets.)
 func Pipe(a, b net.Conn, p Profile) {
 	var wg sync.WaitGroup
 	wg.Go(func() { shapeOneWay(b, a, p) })
@@ -206,19 +210,33 @@ func (px *Proxy) Close() error {
 	return err
 }
 
-// shapedListener fronts an inner listener with a shaped one: clients connect
-// to the outer address, and Accept returns the server end of a loopback
-// connection to the inner listener, with a Pipe shaping traffic between the
-// two. The server sees an ordinary *net.TCPConn.
+// shapedListener stands in for a server's own listener (e.g. an FTP
+// passive data port). Clients connect to outer; Accept hands the server one
+// end of an in-memory net.Pipe — reporting the client's real TCP addresses,
+// so address-based checks (FTP's data-connection IP match) still work —
+// with a Pipe shaping traffic between the client and the other end.
+//
+// No second TCP hop: each client connection costs exactly one real TCP
+// connection, as it would without shaping. An earlier design re-dialed the
+// server over loopback per connection, doubling ephemeral-port use; at
+// FTP's one-connection-per-file rate that exhausted macOS's ~16k ephemeral
+// ports (each closed connection holds one in TIME_WAIT for 30s). Dialing
+// the server's own listener was also unreliable: FTP servers bind passive
+// ports on the wildcard address ("[::]:P"), and any other socket holding
+// 127.0.0.1:P captured the dial. inner is kept only to be closed.
+//
+// Limitation: net.Pipe has no half-close, so when the client half-closes,
+// the server end is closed fully. That suits FTP data connections, which
+// carry data one way per transfer.
 type shapedListener struct {
 	outer, inner net.Listener
 	profile      Profile
-	mu           sync.Mutex // serializes the dial/accept pairing on inner
 }
 
-// WrapListener returns a listener whose Addr() clients should dial, with
-// traffic to inner's server shaped by p. Used for servers that hand out
-// listeners themselves (e.g. FTP passive data ports).
+// WrapListener returns a listener to hand to a server in place of inner:
+// clients dial its Addr(), and traffic between them and the server is
+// shaped by p. Used for servers that create listeners themselves (FTP
+// passive data ports).
 func WrapListener(inner net.Listener, p Profile) (net.Listener, error) {
 	outer, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -232,40 +250,24 @@ func (l *shapedListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	dialed, err := net.Dial("tcp", loopbackAddr(l.inner.Addr()))
-	if err != nil {
-		client.Close()
-		return nil, err
-	}
-	server, err := l.inner.Accept()
-	if err != nil {
-		client.Close()
-		dialed.Close()
-		return nil, err
-	}
-	go Pipe(client, dialed, l.profile)
-	return server, nil
+	near, server := net.Pipe()
+	go Pipe(client, near, l.profile)
+	return &addrConn{Conn: server, local: client.LocalAddr(), remote: client.RemoteAddr()}, nil
 }
 
 func (l *shapedListener) Close() error {
 	return errors.Join(l.outer.Close(), l.inner.Close())
 }
 
+// addrConn overrides a connection's reported addresses.
+type addrConn struct {
+	net.Conn
+	local, remote net.Addr
+}
+
+func (c *addrConn) LocalAddr() net.Addr  { return c.local }
+func (c *addrConn) RemoteAddr() net.Addr { return c.remote }
+
 func (l *shapedListener) Addr() net.Addr { return l.outer.Addr() }
 
 var _ io.Closer = (*Proxy)(nil)
-
-// loopbackAddr returns a dialable address for a listener's Addr: a listener
-// bound to the unspecified address ("[::]:port", "0.0.0.0:port") is dialed
-// as 127.0.0.1:port. Dialing "[::]" would connect over IPv6 ::1, and servers
-// that require the data connection to come from the same IP as the control
-// connection (FTP) would then reject it.
-func loopbackAddr(a net.Addr) string {
-	tcp, ok := a.(*net.TCPAddr)
-	if !ok || !tcp.IP.IsUnspecified() {
-		return a.String()
-	}
-	return net.JoinHostPort("127.0.0.1", strconv.Itoa(tcp.Port))
-}

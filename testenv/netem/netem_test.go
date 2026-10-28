@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -108,8 +109,10 @@ func TestWrapListenerShapesAcceptedConns(t *testing.T) {
 		if err != nil {
 			return
 		}
-		if _, ok := s.(*net.TCPConn); !ok {
-			t.Errorf("server side is %T, want *net.TCPConn", s)
+		// The server must see the client's real TCP address (FTP servers
+		// match the data connection's IP against the control connection's).
+		if a, ok := s.RemoteAddr().(*net.TCPAddr); !ok || !a.IP.IsLoopback() {
+			t.Errorf("server sees remote addr %v (%T), want a loopback *net.TCPAddr", s.RemoteAddr(), s.RemoteAddr())
 		}
 		io.Copy(s, s)
 		s.Close()
@@ -146,5 +149,51 @@ func TestUnshapedPassesEOF(t *testing.T) {
 	got, err := io.ReadAll(c)
 	if err != nil || string(got) != "done" {
 		t.Errorf("got %q, %v — half-close not propagated", got, err)
+	}
+}
+
+// Regression test: a server's wildcard-bound listener ("[::]:P") whose
+// port number is also held on 127.0.0.1 by another socket. Dialing
+// 127.0.0.1:P would reach that other socket, so a wrapper that dials the
+// server's listener hangs; WrapListener must still deliver the connection.
+func TestWrapListenerSurvivesShadowedWildcardPort(t *testing.T) {
+	inner, err := net.Listen("tcp", "[::]:0")
+	if err != nil {
+		t.Skipf("no IPv6 wildcard listener: %v", err)
+	}
+	port := inner.Addr().(*net.TCPAddr).Port
+	decoy, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		t.Skipf("OS refused to shadow the port (%v) — collision can't occur here", err)
+	}
+	defer decoy.Close()
+
+	ln, err := WrapListener(inner, Local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan error, 1)
+	go func() {
+		s, err := ln.Accept()
+		if err == nil {
+			s.Close()
+		}
+		accepted <- err
+	}()
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	select {
+	case err := <-accepted:
+		if err != nil {
+			t.Fatalf("accept: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("server never received the connection — routed to the shadowing socket")
 	}
 }

@@ -50,3 +50,9 @@ Results report time per operation, MB/s and files/s. The workflow for an optimiz
 4. `make bench-compare OLD=before NEW=after`
 
 Results depend on the machine, so they are git-ignored.
+
+### Reading results
+
+- **Local OpenSSH overstates directory-listing cost.** Every SFTP directory listing includes an `ls -l` line per entry, and that needs an owner/group name lookup. On macOS those lookups are slow, about 0.17 ms per entry (`BenchmarkRemoteOps` shows it). A typical Linux host doesn't pay this. Over `wan`, round trips dominate and the two servers converge. Use `sftp-inproc` to isolate client-side CPU cost.
+- **FTP on loopback is paced.** FTP opens one TCP connection per file, faster than macOS recycles ports (each closed connection holds a port for 30 s). Between iterations, outside the timer, benchmarks wait until the kernel's TCP socket count drains (`bench/drain.go`). Timings are unaffected.
+- **Debugging a failing benchmark:** `SFYNC_BENCH_VERBOSE=/path/to/log` keeps sfync's raw `debug:` errors without the slowdown of terminal output. Use `=1` to print them to the terminal.
