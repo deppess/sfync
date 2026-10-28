@@ -40,7 +40,7 @@ type Profile struct {
 
 // Bounds for FTPConnections.
 const (
-	DefaultFTPConnections = 4
+	DefaultFTPConnections = 8
 	MaxFTPConnections     = 16
 )
 
