@@ -102,7 +102,7 @@ Ignored directories are skipped by the file watcher. Changes to `.syncignore` ar
 
 ## Daemon
 
-Watches all profiles with `autoSync: true`. Debounces per-file, retries with exponential backoff, batches desktop notifications, and hot-reloads config on save.
+Watches all profiles with `autoSync: true`. It debounces per file, uploads several changed files at once (never the same file twice at once), retries with exponential backoff, batches desktop notifications, and hot-reloads the config on save. New folders are picked up with everything already inside them, including whole trees created at once by `git checkout`, `mkdir -p` or unpacking an archive.
 
 By default the daemon only uploads new and changed files. Set `"autoSyncDeletes": true` on a profile to also delete the remote copy when a file is deleted or renamed away locally. It's opt-in because every local deletion is mirrored, including files that vanish during a `git checkout` of another branch. Safeguards:
 
@@ -141,6 +141,15 @@ sfync --completions fish > ~/.config/fish/completions/sfync.fish
 sfync --completions bash > ~/.local/share/bash-completion/completions/sfync
 sfync --completions zsh  > ~/.zfunc/_sfync
 ```
+
+## Development
+
+```bash
+make test-all   # unit tests, plus end-to-end tests against real OpenSSH and FTP/FTPS servers
+make bench      # benchmarks under emulated network conditions
+```
+
+Everything runs locally against throwaway servers. See [TESTING.md](TESTING.md).
 
 ## License
 
