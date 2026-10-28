@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/deppess/sfync/internal/config"
 	"github.com/deppess/sfync/internal/transfer"
@@ -81,7 +83,10 @@ type fakeSource struct {
 	gets   int
 }
 
-func (s *fakeSource) Get(string) (transfer.RemoteClient, error) { s.gets++; return s.client, nil }
+func (s *fakeSource) Acquire(string) (transfer.RemoteClient, func(error), error) {
+	s.gets++
+	return s.client, func(error) {}, nil
+}
 
 type result struct{ successes, errs []string }
 
@@ -160,8 +165,10 @@ func TestDeletionKeepsNonEmptyRemoteDirWithoutError(t *testing.T) {
 	p := &config.Profile{Context: ctx, RemotePath: "/r", AutoSyncDeletes: true}
 	r := runTask(t, p, src, filepath.Join(ctx, "assets"))
 
-	if got := strings.Join(src.client.calls, ","); got != "rmdir /r/assets" {
-		t.Errorf("calls = %q (must be a single non-recursive rmdir)", got)
+	// Retried (concurrent file deletes may still be emptying it), never
+	// recursive, and finally kept quietly — no error notification.
+	if got := strings.Join(src.client.calls, ","); got != "rmdir /r/assets,rmdir /r/assets,rmdir /r/assets" {
+		t.Errorf("calls = %q (want only non-recursive rmdir attempts)", got)
 	}
 	if len(r.errs) != 0 || len(r.successes) != 0 {
 		t.Errorf("non-empty dir should be kept quietly: %+v", r)
@@ -217,5 +224,107 @@ func TestQueueRemembersEnsuredDirectories(t *testing.T) {
 	q.processUpload(&uploadTask{profileName: "p", filePath: filepath.Join(ctx, "css/b.css")}, ok, fail)
 	if m := src.client.mkdirs; m != 3 {
 		t.Errorf("after reload, MkdirAll calls = %d, want 3", m)
+	}
+}
+
+// blockingRemote's uploads wait on a gate, tracking concurrency per path.
+type blockingRemote struct {
+	transfer.RemoteClient
+	gate    chan struct{}
+	mu      sync.Mutex
+	active  map[string]int
+	maxSame int // most concurrent uploads of one path
+	maxAll  int // most concurrent uploads overall
+	count   map[string]int
+	all     int
+}
+
+func (b *blockingRemote) MkdirAll(string) error { return nil }
+func (b *blockingRemote) Upload(_, remote string) error {
+	b.mu.Lock()
+	b.active[remote]++
+	b.all++
+	b.maxSame = max(b.maxSame, b.active[remote])
+	b.maxAll = max(b.maxAll, b.all)
+	b.count[remote]++
+	b.mu.Unlock()
+	<-b.gate
+	b.mu.Lock()
+	b.active[remote]--
+	b.all--
+	b.mu.Unlock()
+	return nil
+}
+
+type blockingSource struct{ c *blockingRemote }
+
+func (s blockingSource) Acquire(string) (transfer.RemoteClient, func(error), error) {
+	return s.c, func(error) {}, nil
+}
+
+// Different files upload in parallel; one file is never uploaded twice at
+// once, and a change that arrives during its upload is synced afterwards.
+func TestQueueConcurrencyAndPerFileExclusivity(t *testing.T) {
+	ctx := t.TempDir()
+	var files []string
+	for i := range 6 {
+		f := filepath.Join(ctx, fmt.Sprintf("f%d.txt", i))
+		os.WriteFile(f, []byte("x"), 0o644)
+		files = append(files, f)
+	}
+	remote := &blockingRemote{gate: make(chan struct{}), active: map[string]int{}, count: map[string]int{}}
+	q := NewUploadQueue(map[string]*config.Profile{"p": {Context: ctx, RemotePath: "/r"}}, blockingSource{remote})
+	var done sync.WaitGroup
+	q.Start(func(_, _ string) { done.Done() }, func(_, rel string, err error, _ int) {
+		t.Errorf("%s failed: %v", rel, err)
+		done.Done()
+	})
+	defer q.Stop()
+
+	waitFor := func(cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatal("timed out")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	inFlight := func() int { remote.mu.Lock(); defer remote.mu.Unlock(); return remote.all }
+
+	// Six different files: all upload at once (within queueWorkers).
+	done.Add(len(files))
+	for _, f := range files {
+		q.Enqueue("p", f)
+	}
+	waitFor(func() bool { return inFlight() == len(files) })
+
+	// f0 changes twice more while its upload is in flight: must queue, not
+	// run concurrently — and the two changes collapse into one re-upload.
+	done.Add(1)
+	q.Enqueue("p", files[0])
+	q.Enqueue("p", files[0])
+	time.Sleep(50 * time.Millisecond)
+
+	close(remote.gate) // let everything finish
+	finished := make(chan struct{})
+	go func() { done.Wait(); close(finished) }()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("uploads never completed")
+	}
+
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	if remote.maxSame != 1 {
+		t.Errorf("a file was uploaded %d times concurrently", remote.maxSame)
+	}
+	if remote.maxAll < len(files) {
+		t.Errorf("max concurrent uploads = %d, want %d (parallel)", remote.maxAll, len(files))
+	}
+	if n := remote.count["/r/f0.txt"]; n != 2 {
+		t.Errorf("f0 uploaded %d times, want 2 (original + one collapsed re-sync)", n)
 	}
 }

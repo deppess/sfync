@@ -16,7 +16,15 @@ import (
 	"github.com/deppess/sfync/internal/transfer"
 )
 
-// UploadQueue manages sequential file uploads with retry logic
+// queueWorkers is how many files the daemon syncs at once. A burst of
+// changes (a formatter rewriting files, a git pull, a build) is otherwise
+// uploaded strictly one after another, each paying its full round trips.
+// Over SFTP small files share one session; over FTP the effective limit is
+// ftpConnections.
+const queueWorkers = 8
+
+// UploadQueue manages concurrent file uploads with retry logic. A given
+// file is never synced by two workers at once (see claim).
 type UploadQueue struct {
 	queue      chan *uploadTask
 	done       chan struct{} // closed by Stop to unblock Enqueue and Start
@@ -31,12 +39,21 @@ type UploadQueue struct {
 	// and entirely on config reload.
 	knownDirs map[string]bool
 	dirsMu    sync.Mutex
+
+	// inFlight holds files (profile + "\x00" + path) a worker is syncing;
+	// pending holds the latest task that arrived for one meanwhile, run as
+	// soon as the current sync finishes. Two concurrent uploads of the same
+	// file would write the same partial file.
+	inFlight map[string]bool
+	pending  map[string]*uploadTask
+	flightMu sync.Mutex
 }
 
-// clientSource hands out live connections per profile — satisfied by
-// *transfer.ConnectionPool, and by fakes in tests.
+// clientSource leases live connections per profile — satisfied by
+// *transfer.ConnectionPool, and by fakes in tests. release must be called
+// once with the outcome of the work done on the connection.
 type clientSource interface {
-	Get(profileName string) (transfer.RemoteClient, error)
+	Acquire(profileName string) (client transfer.RemoteClient, release func(error), err error)
 }
 
 type uploadTask struct {
@@ -51,6 +68,8 @@ func NewUploadQueue(profiles map[string]*config.Profile, pool clientSource) *Upl
 		done:     make(chan struct{}),
 		profiles: profiles,
 		clients:  pool,
+		inFlight: make(map[string]bool),
+		pending:  make(map[string]*uploadTask),
 	}
 }
 
@@ -72,18 +91,60 @@ func (q *UploadQueue) Enqueue(profileName, filePath string) {
 	}
 }
 
-// Start starts processing the upload queue
+// Start starts processing the upload queue with queueWorkers workers.
+// Callbacks may be called concurrently.
 func (q *UploadQueue) Start(onSuccess func(profileName, filePath string), onError func(profileName, filePath string, err error, failCount int)) {
-	q.wg.Go(func() {
-		for {
-			select {
-			case task := <-q.queue:
-				q.processUpload(task, onSuccess, onError)
-			case <-q.done:
-				return
+	for range queueWorkers {
+		q.wg.Go(func() {
+			for {
+				select {
+				case task := <-q.queue:
+					for task != nil {
+						if !q.claim(task) {
+							break // already in flight: it'll re-run with this task
+						}
+						q.processUpload(task, onSuccess, onError)
+						task = q.finish(task)
+					}
+				case <-q.done:
+					return
+				}
 			}
-		}
-	})
+		})
+	}
+}
+
+func taskKey(t *uploadTask) string { return t.profileName + "\x00" + t.filePath }
+
+// claim marks task's file as being synced, reporting false if another
+// worker already has it — in which case task is parked as that file's
+// pending work (replacing any older one: only the latest state matters).
+func (q *UploadQueue) claim(task *uploadTask) bool {
+	q.flightMu.Lock()
+	defer q.flightMu.Unlock()
+	key := taskKey(task)
+	if q.inFlight[key] {
+		q.pending[key] = task
+		return false
+	}
+	q.inFlight[key] = true
+	return true
+}
+
+// finish releases task's file and returns work that arrived for it in the
+// meantime (nil if none), which the caller runs next — the file changed
+// again while it was being uploaded.
+func (q *UploadQueue) finish(task *uploadTask) *uploadTask {
+	q.flightMu.Lock()
+	defer q.flightMu.Unlock()
+	key := taskKey(task)
+	delete(q.inFlight, key)
+	next, ok := q.pending[key]
+	if !ok {
+		return nil
+	}
+	delete(q.pending, key)
+	return next
 }
 
 // processUpload handles uploading a single file with retry logic
@@ -176,7 +237,7 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 			return
 		}
 
-		client, connErr := q.clients.Get(task.profileName)
+		client, release, connErr := q.clients.Acquire(task.profileName)
 		if connErr != nil {
 			lastErr = connErr
 			if attempt < maxRetries-1 {
@@ -191,7 +252,8 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 		}
 
 		if missing {
-			deleted, delErr := deleteRemote(client, remotePath, relPath)
+			deleted, delErr := deleteRemote(client, remotePath, relPath, attempt == maxRetries-1)
+			release(delErr)
 			if deleted {
 				// A deleted directory invalidates remembered ones under it.
 				q.forgetDirs(task.profileName)
@@ -221,6 +283,7 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 		if q.dirKnown(task.profileName, remoteDir) {
 			// already ensured
 		} else if mkErr := client.MkdirAll(remoteDir); mkErr != nil {
+			release(mkErr)
 			lastErr = mkErr
 			if attempt < maxRetries-1 {
 				fmt.Fprintf(os.Stderr, "Directory creation failed (attempt %d/%d): %s - %v\n", attempt+1, maxRetries, relPath, mkErr)
@@ -242,6 +305,7 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 		} else {
 			uploadErr = client.Upload(absFile, remotePath)
 		}
+		release(uploadErr)
 		if uploadErr == nil {
 			onSuccess(task.profileName, relPath)
 			return
@@ -270,7 +334,11 @@ func (q *UploadQueue) processUpload(task *uploadTask, onSuccess func(string, str
 // A directory is only removed if it's empty — never recursively — so remote
 // files that are .syncignore'd or were never synced are left alone; a
 // non-empty directory is kept with a log line rather than retried.
-func deleteRemote(client transfer.RemoteClient, remotePath, relPath string) (bool, error) {
+//
+// With concurrent workers, a directory's own deletion can race the deletion
+// of files inside it and briefly see it non-empty; unless final, that's
+// returned as a retryable error so the retry loop tries again shortly.
+func deleteRemote(client transfer.RemoteClient, remotePath, relPath string, final bool) (bool, error) {
 	info, err := client.Stat(remotePath)
 	if transfer.IsNotExist(err) {
 		return false, nil
@@ -281,6 +349,9 @@ func deleteRemote(client transfer.RemoteClient, remotePath, relPath string) (boo
 
 	if info.IsDir {
 		if err := client.RemoveDir(remotePath); err != nil {
+			if !final {
+				return false, fmt.Errorf("directory not yet removable: %w", err)
+			}
 			fmt.Fprintf(os.Stderr, "Kept remote directory %s/ (not empty or not removable: %v)\n", relPath, err)
 			return false, nil
 		}
