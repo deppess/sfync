@@ -190,3 +190,18 @@ func TestFTPConnectionsDefaultsAndValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestSetDefaultsCleansContext(t *testing.T) {
+	for in, want := range map[string]string{
+		"/home/me/site/":   "/home/me/site",
+		"/home/me//site":   "/home/me/site",
+		"/home/me/./site/": "/home/me/site",
+		"":                 "",
+	} {
+		p := Profile{Context: in}
+		p.SetDefaults()
+		if p.Context != want {
+			t.Errorf("Context %q -> %q, want %q", in, p.Context, want)
+		}
+	}
+}
