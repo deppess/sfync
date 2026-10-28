@@ -8,7 +8,7 @@ import (
 	"github.com/deppess/sfync/cmd"
 )
 
-const version = "3.3.0"
+const version = "3.4.0"
 
 // requireUnix gates the subcommands that need Linux- or macOS-specific
 // background-service/mount tooling (rclone mounting, systemd/launchd).
