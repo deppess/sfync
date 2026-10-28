@@ -10,11 +10,18 @@ import (
 
 // Send displays a desktop notification via notify-send (Linux/libnotify).
 func Send(title, message string, urgency Urgency) {
+	if disabled() {
+		return
+	}
 	exec.Command("notify-send", "-u", string(urgency), title, message).Run()
 }
 
-// EnsureReady verifies notify-send is on PATH.
+// EnsureReady verifies notify-send is on PATH (unless notifications are
+// disabled).
 func EnsureReady() error {
+	if disabled() {
+		return nil
+	}
 	return deps.CheckRequired("notify-send")
 }
 

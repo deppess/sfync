@@ -86,6 +86,8 @@ sfync off                       stop the daemon
 
 Transfers are atomic: files are written to a hidden `.<name>.sfync-part` beside the destination and renamed into place only once complete, so a failed transfer never leaves a truncated file on the server or destroys your local copy. A leftover `.sfync-part` on the server is from an interrupted large upload; the next upload of that file resumes it.
 
+Commands report on the terminal and with a desktop notification, and exit with status 1 on failure. For scripts and CI, set `SFYNC_NO_NOTIFY=1` to turn notifications off.
+
 ## .syncignore
 
 Place a `.syncignore` in your project root. Supports [doublestar](https://github.com/bmatcuk/doublestar) glob syntax.

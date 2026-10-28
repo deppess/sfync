@@ -152,7 +152,6 @@ func runMirror(profileName, contextFile string, d direction) error {
 		fmt.Fprintf(os.Stderr, "  error: %s\n", e)
 	}
 	notify.Error("SFTP Error", fmt.Sprintf("%s failed with %d errors", d.verb, len(result.Errors)))
-	fmt.Fprintf(os.Stderr, "✗ %s failed!\n", d.verb)
 	return fmt.Errorf("%s failed with %d errors", d.noun, len(result.Errors))
 }
 
