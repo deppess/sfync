@@ -184,10 +184,16 @@ func HumanSize(bytes int64) string {
 	return fmt.Sprintf("%.1f GB", float64(bytes)/(1024*1024*1024))
 }
 
-// translateError converts library errors to clean user-facing messages
+// translateError converts library errors to clean user-facing messages.
+// An error already cleaned by wrapError yields its message without the
+// operation prefix, so callers that add their own context (e.g. "upload
+// <file>: ...") don't repeat it, and the message isn't translated twice.
 func translateError(err error) string {
 	if err == nil {
 		return ""
+	}
+	if ce, ok := errors.AsType[*cleanError](err); ok {
+		return ce.msg
 	}
 	msg := err.Error()
 
@@ -257,26 +263,32 @@ func translateError(err error) string {
 	return msg
 }
 
-// wrapError logs the raw error and returns a clean one
+// wrapError logs the raw error and returns a clean one. An already-clean
+// error is returned unchanged: the innermost operation is the most specific
+// and it was already logged.
 func wrapError(operation string, err error) error {
 	if err == nil {
 		return nil
 	}
+	if _, ok := errors.AsType[*cleanError](err); ok {
+		return err
+	}
 	// Raw error goes to stderr for debugging
 	fmt.Fprintf(os.Stderr, "  debug: %s: %v\n", operation, err)
 	// Clean error returned to caller
-	return &cleanError{msg: fmt.Sprintf("%s: %s", operation, translateError(err)), err: err}
+	return &cleanError{op: operation, msg: translateError(err), err: err}
 }
 
 // cleanError carries the translated, user-facing message while keeping the
 // raw library error reachable via errors.Is/As — e.g. so callers can test
 // errors.Is(err, fs.ErrNotExist) instead of matching message text.
 type cleanError struct {
-	msg string
+	op  string // e.g. "upload"
+	msg string // translated, e.g. "Permission denied"
 	err error
 }
 
-func (e *cleanError) Error() string { return e.msg }
+func (e *cleanError) Error() string { return e.op + ": " + e.msg }
 func (e *cleanError) Unwrap() error { return e.err }
 
 // IsNotExist reports whether err from a RemoteClient means the remote path
