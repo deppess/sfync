@@ -12,14 +12,23 @@ sfync
 vendor/
 *.out
 
-# IDE / AI
 .vscode/
 .idea/
-.claude/
 *.swp
 *.swo
 *~
-.DS_Store
 
 # Benchmark results (machine-specific)
 testenv/bench/results/
+
+# Local tooling
+.claude/
+.cursor/
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+
+# OS and secrets
+.DS_Store
+.env
+.env.*
