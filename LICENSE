@@ -1,21 +1,35 @@
-MIT License
+All Rights Reserved - View Only License
 
-Copyright (c) 2025 Deppes
+Copyright (c) 2025-2026 deppes. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software, its source code, documentation, assets and other materials
+(the "Work") are the exclusive property of the copyright holder. The Work is
+published for viewing only.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+You may view the Work on the website where the copyright holder publishes it.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Except for that permission, no license or right is granted, whether express,
+implied or otherwise. Without prior written permission from the copyright
+holder, you may not, in whole or in part:
+
+  - copy, reproduce, download, store or mirror the Work;
+  - use, run, install, compile or deploy the Work;
+  - modify, adapt, translate or create derivative works of the Work;
+  - distribute, publish, sublicense, sell, rent or otherwise transfer the Work;
+  - use the Work or anything based on it for any commercial purpose;
+  - use the Work to train, tune or test any machine learning or AI system;
+  - remove or alter this notice or any other notice in the Work.
+
+Nothing in this license limits a right that cannot be excluded by law, or a
+right a hosting service's terms require for the Work to be displayed there.
+Any such right covers only that service and permits nothing else.
+
+Any use outside this license infringes the copyright holder's rights and may
+result in legal action. Third-party components stay under their own licenses,
+as identified in the Work; this license does not apply to them.
+
+THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. THE COPYRIGHT
+HOLDER IS NOT LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE
+WORK.
+
+For permission requests, contact the copyright holder.

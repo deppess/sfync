@@ -157,4 +157,4 @@ Everything runs locally against throwaway servers. See [TESTING.md](TESTING.md).
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+All rights reserved. Published for viewing only: no copying, use, modification, distribution or sale without written permission. See [LICENSE](LICENSE).
