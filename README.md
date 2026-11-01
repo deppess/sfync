@@ -2,6 +2,8 @@
 
 SFTP/FTP sync, mounting, and auto-upload daemon for Linux and macOS — bidirectional mirror sync, single-file push/pull, mounting, and editor integration.
 
+Source: [Codeberg](https://codeberg.org/deppes/sfync) (primary) · [GitHub](https://github.com/deppess/sfync) (mirror)
+
 ## Dependencies
 
 Linux:
@@ -144,7 +146,7 @@ sfync --completions bash > ~/.local/share/bash-completion/completions/sfync
 sfync --completions zsh  > ~/.zfunc/_sfync
 ```
 
-## Development
+## Build and test
 
 ```bash
 make test-all   # unit tests, plus end-to-end tests against real OpenSSH and FTP/FTPS servers
@@ -155,4 +157,4 @@ Everything runs locally against throwaway servers. See [TESTING.md](TESTING.md).
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
