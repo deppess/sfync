@@ -157,4 +157,6 @@ Everything runs locally against throwaway servers. See [TESTING.md](TESTING.md).
 
 ## License
 
-All rights reserved. Published for viewing only: no copying, use, modification, distribution or sale without written permission. See [LICENSE](LICENSE).
+AGPL-3.0-or-later. See [LICENSE](LICENSE).
+
+I ask that this code not be used to train AI models. This is a request, not a license term.
